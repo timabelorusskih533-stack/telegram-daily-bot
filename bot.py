@@ -1,87 +1,108 @@
 import asyncio
-import json
+import logging
 import os
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+import feedparser
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-TOKEN = os.getenv("BOT_TOKEN")
-DATA_FILE = "tasks.json"
+# Токен подтянется из настроек хостинга (Environment Variables)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TIMEZONE = "Europe/Moscow"
 
-bot = Bot(token=TOKEN)
+RSS_FEEDS = {
+    "Главные новости": "https://lenta.ru/rss/news",
+    "Технологии": "https://habr.com/ru/rss/news/?fl=ru",
+}
+
+subscribers = set()
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-def load_tasks():
-    if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
 
-def save_tasks(tasks):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(tasks, f, ensure_ascii=False, indent=2)
+def get_latest_news(limit_per_source: int = 3) -> str:
+    digest = ["📰 <b>Сводка актуальных новостей:</b>\n"]
+    
+    for category, url in RSS_FEEDS.items():
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            continue
+            
+        digest.append(f"<b>— {category} —</b>")
+        for entry in feed.entries[:limit_per_source]:
+            title = entry.title
+            link = entry.link
+            digest.append(f"• <a href='{link}'>{title}</a>")
+        digest.append("")
 
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📋 Мои задачи"), KeyboardButton(text="🗑 Очистить всё")]
-    ],
-    resize_keyboard=True
-)
+    if len(digest) == 1:
+        return "Не удалось загрузить новости. Проверьте ссылки на RSS."
+        
+    return "\n".join(digest)
 
-@dp.message(CommandStart())
-async def cmd_start(message: Message):
+
+async def send_scheduled_news(time_of_day: str):
+    if not subscribers:
+        return
+
+    news_text = get_latest_news()
+    header = "☀️ <b>Доброе утро!</b>\n\n" if time_of_day == "morning" else "🌙 <b>Добрый вечер! Итоги дня:</b>\n\n"
+    full_message = header + news_text
+
+    for user_id in list(subscribers):
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text=full_message,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить сообщение {user_id}: {e}")
+            subscribers.discard(user_id)
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    subscribers.add(message.from_user.id)
     await message.answer(
-        "Привет! Я твой бот-ежедневник.\n\n"
-        "• Просто напиши мне любую задачу текстом — я её запишу.\n"
-        "• Отправь номер задачи (например, `1`), чтобы вычеркнуть её из списка.",
-        reply_markup=main_kb
+        "Привет! Я подписал тебя на ежедневную сводку новостей.\n"
+        "Буду присылать дайджест в <b>08:00</b> и <b>20:00</b>.\n\n"
+        "Команды:\n"
+        "/news — получить свежую сводку прямо сейчас\n"
+        "/stop — отписаться от рассылки",
+        parse_mode="HTML"
     )
 
-@dp.message(F.text == "📋 Мои задачи")
-async def show_tasks(message: Message):
-    user_id = str(message.from_user.id)
-    tasks = load_tasks().get(user_id, [])
-    if not tasks:
-        await message.answer("Список задач пока пуст. Напиши что-нибудь, чтобы добавить!")
-        return
-    text = "📌 **Твои задачи:**\n\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(tasks))
-    await message.answer(text, parse_mode="Markdown")
 
-@dp.message(F.text == "🗑 Очистить всё")
-async def clear_tasks(message: Message):
-    user_id = str(message.from_user.id)
-    all_tasks = load_tasks()
-    all_tasks[user_id] = []
-    save_tasks(all_tasks)
-    await message.answer("Все задачи удалены!")
+@dp.message(Command("stop"))
+async def cmd_stop(message: types.Message):
+    subscribers.discard(message.from_user.id)
+    await message.answer("Ты отписался от утренней и вечерней рассылки. Чтобы вернуться, нажми /start.")
 
-@dp.message(F.text)
-async def handle_text(message: Message):
-    user_id = str(message.from_user.id)
-    all_tasks = load_tasks()
-    user_tasks = all_tasks.get(user_id, [])
-    text = message.text.strip()
 
-    # Если прислали цифру — удаляем задачу под этим номером
-    if text.isdigit():
-        idx = int(text) - 1
-        if 0 <= idx < len(user_tasks):
-            removed = user_tasks.pop(idx)
-            all_tasks[user_id] = user_tasks
-            save_tasks(all_tasks)
-            await message.answer(f"✅ Выполнено и удалено: _{removed}_", parse_mode="Markdown")
-        else:
-            await message.answer("Задачи с таким номером нет.")
-        return
+@dp.message(Command("news"))
+async def cmd_news(message: types.Message):
+    await message.answer("Собираю свежие новости...")
+    news_text = get_latest_news()
+    await message.answer(news_text, parse_mode="HTML", disable_web_page_preview=True)
 
-    # Иначе добавляем новую задачу
-    user_tasks.append(text)
-    all_tasks[user_id] = user_tasks
-    save_tasks(all_tasks)
-    await message.answer(f"➕ Записал: **{text}**", parse_mode="Markdown")
 
 async def main():
+    if not BOT_TOKEN:
+        raise ValueError("Не задана переменная окружения BOT_TOKEN!")
+
+    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    scheduler.add_job(send_scheduled_news, trigger="cron", hour=8, minute=0, args=["morning"])
+    scheduler.add_job(send_scheduled_news, trigger="cron", hour=20, minute=0, args=["evening"])
+    scheduler.start()
+    
+    logging.info("Бот запущен!")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
