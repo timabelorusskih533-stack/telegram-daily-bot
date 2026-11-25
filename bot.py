@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -36,7 +37,9 @@ text_cache: dict[str, str] = {}
 # ---------- Telegraph ----------
 
 async def telegraph_call(session: aiohttp.ClientSession, method: str, data: dict) -> dict:
-    async with session.post(f"https://api.telegra.ph/{method}", json=data) as resp:
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    async with session.post(f"https://api.telegra.ph/{method}", data=body,
+                            headers={"Content-Type": "application/json"}) as resp:
         result = await resp.json()
     if not result.get("ok"):
         raise RuntimeError(f"Telegraph {method}: {result.get('error')}")
@@ -55,14 +58,39 @@ async def ensure_telegraph_account(session: aiohttp.ClientSession) -> str:
     return telegraph_token
 
 
-# Лимит на одну новость: вся статья Telegraph должна уложиться в 64 КБ
-def paragraphs(text: str, limit: int = 4000) -> list:
+MAX_CONTENT_BYTES = 40000  # у Telegraph лимит 64 КБ на статью, берём с запасом
+
+
+def paragraphs(text: str, limit: int) -> list:
+    if len(text) > limit:
+        cut = text[:limit]
+        # Обрезаем по концу предложения, чтобы не обрывать на полуслове
+        end = max(cut.rfind(". "), cut.rfind(".\n"))
+        text = (cut[:end + 1] if end > limit // 2 else cut) + " …"
     nodes = []
-    for paragraph in text[:limit].split("\n"):
+    for paragraph in text.split("\n"):
         paragraph = paragraph.strip()
         if paragraph:
             nodes.append({"tag": "p", "children": [paragraph]})
     return nodes
+
+
+def build_content(sections: list, limit: int) -> list:
+    content = []
+    for category, items in sections:
+        content.append({"tag": "h3", "children": [category]})
+        for title, text in items:
+            content.append({"tag": "h4", "children": [title]})
+            content.extend(paragraphs(text, limit))
+        content.append({"tag": "p", "children": [
+            {"tag": "i", "children": [f"Источник: {SOURCE_NAMES.get(category, category)}"]}
+        ]})
+        content.append({"tag": "hr"})
+    return content
+
+
+def content_size(content: list) -> int:
+    return len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
 
 
 async def get_full_text(session: aiohttp.ClientSession, entry) -> str:
@@ -97,34 +125,44 @@ SOURCE_NAMES = {
 
 async def make_digest() -> str | None:
     """Собирает все новости в одну статью Telegraph и возвращает её адрес."""
-    content = []
+    sections = []
     async with aiohttp.ClientSession() as session:
         for category, url in RSS_FEEDS.items():
             feed = await asyncio.to_thread(feedparser.parse, url)
-            entries = feed.entries[:NEWS_PER_SOURCE]
-            if not entries:
-                continue
-            content.append({"tag": "h3", "children": [category]})
-            for entry in entries:
+            items = []
+            for entry in feed.entries[:NEWS_PER_SOURCE]:
                 text = await get_full_text(session, entry)
-                content.append({"tag": "h4", "children": [entry.title]})
-                content.extend(paragraphs(text))
-            content.append({"tag": "p", "children": [
-                {"tag": "i", "children": [f"Источник: {SOURCE_NAMES.get(category, category)}"]}
-            ]})
-            content.append({"tag": "hr"})
+                items.append((entry.title, text))
+            if items:
+                sections.append((category, items))
 
-        if not content:
+        if not sections:
             return None
+
+        # Сокращаем тексты, пока статья не уложится в лимит Telegraph
+        limit = 6000
+        content = build_content(sections, limit)
+        while content_size(content) > MAX_CONTENT_BYTES and limit > 300:
+            limit = int(limit * 0.8)
+            content = build_content(sections, limit)
 
         token = await ensure_telegraph_account(session)
         title = f"Сводка новостей — {datetime.now(MOSCOW).strftime('%d.%m, %H:%M')}"
-        page = await telegraph_call(session, "createPage", {
-            "access_token": token,
-            "title": title,
-            "author_name": "botkaracikov",
-            "content": content,
-        })
+        while True:
+            try:
+                page = await telegraph_call(session, "createPage", {
+                    "access_token": token,
+                    "title": title,
+                    "author_name": "botkaracikov",
+                    "content": content,
+                })
+                break
+            except RuntimeError as e:
+                # Если всё равно слишком большая — сокращаем ещё вдвое и пробуем снова
+                if "CONTENT_TOO_BIG" not in str(e) or limit <= 300:
+                    raise
+                limit //= 2
+                content = build_content(sections, limit)
     return page["url"]
 
 
