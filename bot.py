@@ -62,16 +62,20 @@ data: dict = {"users": {}, "sent": []}
 
 def load_data():
     global data
-    try:
-        with open(DATA_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        logging.error(f"Не удалось прочитать {DATA_FILE}: {e}")
+    # Если общее хранилище подключили позже — переносим данные из старой папки
+    for path in (DATA_FILE, os.path.join("data", "botkaracikov_data.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            break
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logging.error(f"Не удалось прочитать {path}: {e}")
     data.setdefault("users", {})
     data.setdefault("sent", [])
     logging.info(f"Данные: {DATA_FILE}, пользователей: {len(data['users'])}")
+    save_data()
 
 
 def save_data():
