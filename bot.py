@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import feedparser
@@ -18,6 +19,7 @@ RSS_FEEDS = {
     "Технологии": "https://habr.com/ru/rss/news/?fl=ru",
 }
 NEWS_PER_SOURCE = 3
+MOSCOW = timezone(timedelta(hours=3))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
 
@@ -27,8 +29,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 telegraph_token = TELEGRAPH_TOKEN
-# Кэш: ссылка на новость -> адрес готовой статьи Telegraph, чтобы не создавать дубли
-telegraph_cache: dict[str, str] = {}
+# Кэш: ссылка на новость -> полный текст, чтобы не скачивать одно и то же повторно
+text_cache: dict[str, str] = {}
 
 
 # ---------- Telegraph ----------
@@ -53,21 +55,20 @@ async def ensure_telegraph_account(session: aiohttp.ClientSession) -> str:
     return telegraph_token
 
 
-def text_to_nodes(text: str, source: str) -> list:
+# Лимит на одну новость: вся статья Telegraph должна уложиться в 64 КБ
+def paragraphs(text: str, limit: int = 4000) -> list:
     nodes = []
-    text = text[:30000]  # у Telegraph ограничение на размер статьи
-    for paragraph in text.split("\n"):
+    for paragraph in text[:limit].split("\n"):
         paragraph = paragraph.strip()
         if paragraph:
             nodes.append({"tag": "p", "children": [paragraph]})
-    nodes.append({"tag": "p", "children": [{"tag": "i", "children": [f"Источник: {source}"]}]})
     return nodes
 
 
-async def make_article(session: aiohttp.ClientSession, entry, source: str) -> str:
+async def get_full_text(session: aiohttp.ClientSession, entry) -> str:
     link = entry.link
-    if link in telegraph_cache:
-        return telegraph_cache[link]
+    if link in text_cache:
+        return text_cache[link]
 
     text = None
     try:
@@ -80,17 +81,10 @@ async def make_article(session: aiohttp.ClientSession, entry, source: str) -> st
     if not text:
         # Запасной вариант — краткое описание из RSS
         summary = entry.get("summary", "")
-        text = trafilatura.extract(f"<html><body><p>{summary}</p></body></html>") or summary or entry.title
+        text = trafilatura.extract(f"<html><body><p>{summary}</p></body></html>") or summary or ""
 
-    token = await ensure_telegraph_account(session)
-    page = await telegraph_call(session, "createPage", {
-        "access_token": token,
-        "title": entry.title[:256],
-        "author_name": source,
-        "content": text_to_nodes(text, source),
-    })
-    telegraph_cache[link] = page["url"]
-    return page["url"]
+    text_cache[link] = text
+    return text
 
 
 # ---------- Новости ----------
@@ -101,30 +95,44 @@ SOURCE_NAMES = {
 }
 
 
-async def collect_articles() -> list[tuple[str, str, str]]:
-    """Возвращает список (категория, заголовок, ссылка на Telegraph)."""
-    articles = []
+async def make_digest() -> str | None:
+    """Собирает все новости в одну статью Telegraph и возвращает её адрес."""
+    content = []
     async with aiohttp.ClientSession() as session:
         for category, url in RSS_FEEDS.items():
             feed = await asyncio.to_thread(feedparser.parse, url)
-            for entry in feed.entries[:NEWS_PER_SOURCE]:
-                try:
-                    page_url = await make_article(session, entry, SOURCE_NAMES.get(category, category))
-                    articles.append((category, entry.title, page_url))
-                except Exception as e:
-                    logging.error(f"Не удалось сделать статью для {entry.get('link')}: {e}")
-    return articles
+            entries = feed.entries[:NEWS_PER_SOURCE]
+            if not entries:
+                continue
+            content.append({"tag": "h3", "children": [category]})
+            for entry in entries:
+                text = await get_full_text(session, entry)
+                content.append({"tag": "h4", "children": [entry.title]})
+                content.extend(paragraphs(text))
+            content.append({"tag": "p", "children": [
+                {"tag": "i", "children": [f"Источник: {SOURCE_NAMES.get(category, category)}"]}
+            ]})
+            content.append({"tag": "hr"})
 
+        if not content:
+            return None
 
-def escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        token = await ensure_telegraph_account(session)
+        title = f"Сводка новостей — {datetime.now(MOSCOW).strftime('%d.%m, %H:%M')}"
+        page = await telegraph_call(session, "createPage", {
+            "access_token": token,
+            "title": title,
+            "author_name": "botkaracikov",
+            "content": content,
+        })
+    return page["url"]
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "Привет! Я собираю свежие новости и присылаю их статьями, "
-        "которые можно читать прямо в Telegram.\n\n"
+        "Привет! Я собираю свежие новости в одну статью, "
+        "которую можно читать прямо в Telegram.\n\n"
         "/news — получить свежую сводку",
         parse_mode="HTML"
     )
@@ -132,22 +140,22 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("news"))
 async def cmd_news(message: types.Message):
-    await message.answer("Собираю свежие новости...")
-    articles = await collect_articles()
+    status = await message.answer("Собираю свежие новости...")
+    try:
+        page_url = await make_digest()
+    except Exception as e:
+        logging.error(f"Не удалось собрать сводку: {e}")
+        page_url = None
 
-    if not articles:
-        await message.answer("Не удалось загрузить новости. Попробуй чуть позже.")
+    if not page_url:
+        await status.edit_text("Не удалось загрузить новости. Попробуй чуть позже.")
         return
 
-    current_category = None
-    for category, title, page_url in articles:
-        header = f"<b>— {category} —</b>\n\n" if category != current_category else ""
-        current_category = category
-        # Заголовок скрыто ведёт на статью Telegraph: в превью появится кнопка «Мгновенный просмотр»
-        await message.answer(
-            f"{header}<a href='{page_url}'>{escape(title)}</a>",
-            parse_mode="HTML",
-        )
+    # Одно сообщение: заголовок скрыто ведёт на статью, в превью — кнопка «Посмотреть»
+    await status.edit_text(
+        f"📰 <a href='{page_url}'>Сводка новостей</a>",
+        parse_mode="HTML",
+    )
 
 
 async def main():
