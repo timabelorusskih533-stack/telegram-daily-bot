@@ -2,42 +2,208 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+import uuid
+from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
 import feedparser
 import trafilatura
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
+from aiogram.types import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
+
+from schedule import SITE_URL, Lesson, parse_schedule
 
 # Токен подтянется из настроек хостинга (Environment Variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Необязательно: постоянный токен Telegraph-аккаунта. Если не задан — создаётся при запуске.
 TELEGRAPH_TOKEN = os.getenv("TELEGRAPH_TOKEN")
 
-RSS_FEEDS = {
-    "Главные новости": "https://lenta.ru/rss/news",
-    "Технологии": "https://habr.com/ru/rss/news/?fl=ru",
-}
-NEWS_PER_SOURCE = 3
 MOSCOW = timezone(timedelta(hours=3))
+EVENING_HOUR = 20          # во сколько присылать расписание на завтра
+REMIND_BEFORE_MIN = 15     # за сколько минут напоминать о паре
+SCHEDULE_REFRESH_MIN = 30  # как часто перечитывать сайт с расписанием
+EXAM_KINDS = {"Экзамен", "Зачёт", "Зачёт (письменный)", "Дифференцированный зачёт", "Контрольная работа"}
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
+# Данные пользователей храним в JSON. На Bothost папка /app/shared не стирается при обновлении бота.
+DATA_DIR = os.getenv("DATA_DIR") or ("/app/shared" if os.path.isdir("/app/shared") else "data")
+DATA_FILE = os.path.join(DATA_DIR, "botkaracikov_data.json")
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+
+def now_msk() -> datetime:
+    return datetime.now(MOSCOW).replace(tzinfo=None)
+
+
+# ======================= Хранилище =======================
+
+NOTIFY_DEFAULTS = {"evening": True, "before": True, "otr": True, "changes": True}
+NOTIFY_NAMES = {
+    "evening": f"Расписание на завтра в {EVENING_HOUR}:00",
+    "before": f"За {REMIND_BEFORE_MIN} минут до пары",
+    "otr": "Незакрытые отработки",
+    "changes": "Изменения в расписании",
+}
+
+data: dict = {"users": {}, "sent": []}
+
+
+def load_data():
+    global data
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"Не удалось прочитать {DATA_FILE}: {e}")
+    data.setdefault("users", {})
+    data.setdefault("sent", [])
+    logging.info(f"Данные: {DATA_FILE}, пользователей: {len(data['users'])}")
+
+
+def save_data():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    data["sent"] = data["sent"][-500:]
+    tmp = DATA_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, DATA_FILE)
+
+
+def get_user(uid: int) -> dict:
+    user = data["users"].setdefault(str(uid), {})
+    user.setdefault("notify", dict(NOTIFY_DEFAULTS))
+    for k, v in NOTIFY_DEFAULTS.items():
+        user["notify"].setdefault(k, v)
+    user.setdefault("otr", [])
+    return user
+
+
+# ======================= Расписание =======================
+
+lessons: list[Lesson] = []
+schedule_loaded_at: datetime | None = None
+DOW = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+DOW_S = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MON = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля",
+       "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+async def fetch_schedule() -> list[Lesson]:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(SITE_URL, params={"t": int(datetime.now().timestamp())},
+                               timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            html = await resp.text()
+    return parse_schedule(html)
+
+
+def lessons_on(day: date) -> list[Lesson]:
+    return [x for x in lessons if x.day == day]
+
+
+def day_title(day: date) -> str:
+    return f"{DOW[day.weekday()].capitalize()}, {day.day} {MON[day.month - 1]}"
+
+
+def esc(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def lesson_line(x: Lesson, with_topic: bool = True) -> str:
+    mark = "❗️ " if x.kind in EXAM_KINDS else ""
+    line = f"<b>{x.start}–{x.end}</b> {mark}{esc(x.subject)}\n<i>{esc(x.kind)}</i> · {esc(x.teacher)}"
+    if with_topic and x.topic:
+        line += f"\n{esc(x.topic)}"
+    return line
+
+
+def day_text(day: date, with_topic: bool = True) -> str:
+    items = lessons_on(day)
+    head = f"📅 <b>{day_title(day)}</b>"
+    if not items:
+        return f"{head}\nПар нет 🎉"
+    return head + "\n\n" + "\n\n".join(lesson_line(x, with_topic) for x in items)
+
+
+def week_text(start: date) -> str:
+    monday = start - timedelta(days=start.weekday())
+    sunday = monday + timedelta(days=6)
+    parts = [f"🗓 <b>Неделя {monday.day} {MON[monday.month - 1]} – {sunday.day} {MON[sunday.month - 1]}</b>"]
+    for i in range(7):
+        day = monday + timedelta(days=i)
+        items = lessons_on(day)
+        if not items:
+            continue
+        rows = [f"{x.start} {'❗️' if x.kind in EXAM_KINDS else ''}{esc(x.subject)} <i>({esc(x.kind)})</i>"
+                for x in items]
+        parts.append(f"<b>{DOW_S[i]}, {day.day} {MON[day.month - 1]}</b>\n" + "\n".join(rows))
+    if len(parts) == 1:
+        parts.append("На этой неделе пар нет 🎉")
+    return "\n\n".join(parts)
+
+
+def upcoming_exams(days: int = 7) -> list[Lesson]:
+    today = now_msk().date()
+    return [x for x in lessons if x.kind in EXAM_KINDS and today <= x.day <= today + timedelta(days=days)]
+
+
+# ======================= Отработки =======================
+
+def open_otr(user: dict) -> list[dict]:
+    return [o for o in user["otr"] if not o.get("done")]
+
+
+def otr_line(o: dict) -> str:
+    d = date.fromisoformat(o["d"])
+    return f"{d.day} {MON[d.month - 1]} {o['t']} — <b>{esc(o['subj'])}</b> <i>({esc(o['kind'])})</i>"
+
+
+def otr_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
+    opened = open_otr(user)
+    done = [o for o in user["otr"] if o.get("done")]
+    text = f"📝 <b>Отработки</b>\nНе отработано: {len(opened)} · Отработано: {len(done)}"
+    if opened:
+        text += "\n\n<b>Нужно отработать:</b>\n" + "\n".join(f"• {otr_line(o)}" for o in opened)
+    if done:
+        text += "\n\n<b>Отработано:</b>\n" + "\n".join(f"✅ {otr_line(o)}" for o in done[-10:])
+    if not user["otr"]:
+        text += "\n\nПока пусто. Нажми «Добавить пропуск», чтобы отметить пропущенную пару."
+    kb = [[InlineKeyboardButton(text=f"✓ Отработал: {o['subj'][:25]} {o['d'][8:]}.{o['d'][5:7]}",
+                                callback_data=f"od:{o['id']}")] for o in opened]
+    kb.append([InlineKeyboardButton(text="➕ Добавить пропуск", callback_data="oa")])
+    if done:
+        kb.append([InlineKeyboardButton(text="↩️ Вернуть отработанную", callback_data="ou")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# ======================= Новости (Telegraph) =======================
+
+RSS_FEEDS = {
+    "Главные новости": "https://lenta.ru/rss/news",
+    "Технологии": "https://habr.com/ru/rss/news/?fl=ru",
+}
+SOURCE_NAMES = {"Главные новости": "Лента.ру", "Технологии": "Хабр"}
+NEWS_PER_SOURCE = 3
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
+MAX_CONTENT_BYTES = 40000  # у Telegraph лимит 64 КБ на статью, берём с запасом
+
 telegraph_token = TELEGRAPH_TOKEN
-# Кэш: ссылка на новость -> полный текст, чтобы не скачивать одно и то же повторно
 text_cache: dict[str, str] = {}
 
 
-# ---------- Telegraph ----------
-
-async def telegraph_call(session: aiohttp.ClientSession, method: str, data: dict) -> dict:
-    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+async def telegraph_call(session: aiohttp.ClientSession, method: str, payload: dict) -> dict:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     async with session.post(f"https://api.telegra.ph/{method}", data=body,
                             headers={"Content-Type": "application/json"}) as resp:
         result = await resp.json()
@@ -54,11 +220,7 @@ async def ensure_telegraph_account(session: aiohttp.ClientSession) -> str:
             "author_name": "Сводка новостей",
         })
         telegraph_token = account["access_token"]
-        logging.info("Создан аккаунт Telegraph")
     return telegraph_token
-
-
-MAX_CONTENT_BYTES = 40000  # у Telegraph лимит 64 КБ на статью, берём с запасом
 
 
 def paragraphs(text: str, limit: int) -> list:
@@ -67,12 +229,7 @@ def paragraphs(text: str, limit: int) -> list:
         # Обрезаем по концу предложения, чтобы не обрывать на полуслове
         end = max(cut.rfind(". "), cut.rfind(".\n"))
         text = (cut[:end + 1] if end > limit // 2 else cut) + " …"
-    nodes = []
-    for paragraph in text.split("\n"):
-        paragraph = paragraph.strip()
-        if paragraph:
-            nodes.append({"tag": "p", "children": [paragraph]})
-    return nodes
+    return [{"tag": "p", "children": [p.strip()]} for p in text.split("\n") if p.strip()]
 
 
 def build_content(sections: list, limit: int) -> list:
@@ -97,7 +254,6 @@ async def get_full_text(session: aiohttp.ClientSession, entry) -> str:
     link = entry.link
     if link in text_cache:
         return text_cache[link]
-
     text = None
     try:
         async with session.get(link, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
@@ -105,22 +261,11 @@ async def get_full_text(session: aiohttp.ClientSession, entry) -> str:
         text = await asyncio.to_thread(trafilatura.extract, html, include_comments=False, include_tables=False)
     except Exception as e:
         logging.warning(f"Не удалось скачать статью {link}: {e}")
-
     if not text:
-        # Запасной вариант — краткое описание из RSS
         summary = entry.get("summary", "")
         text = trafilatura.extract(f"<html><body><p>{summary}</p></body></html>") or summary or ""
-
     text_cache[link] = text
     return text
-
-
-# ---------- Новости ----------
-
-SOURCE_NAMES = {
-    "Главные новости": "Лента.ру",
-    "Технологии": "Хабр",
-}
 
 
 async def make_digest() -> str | None:
@@ -129,17 +274,12 @@ async def make_digest() -> str | None:
     async with aiohttp.ClientSession() as session:
         for category, url in RSS_FEEDS.items():
             feed = await asyncio.to_thread(feedparser.parse, url)
-            items = []
-            for entry in feed.entries[:NEWS_PER_SOURCE]:
-                text = await get_full_text(session, entry)
-                items.append((entry.title, text))
+            items = [(e.title, await get_full_text(session, e)) for e in feed.entries[:NEWS_PER_SOURCE]]
             if items:
                 sections.append((category, items))
-
         if not sections:
             return None
 
-        # Сокращаем тексты, пока статья не уложится в лимит Telegraph
         limit = 6000
         content = build_content(sections, limit)
         while content_size(content) > MAX_CONTENT_BYTES and limit > 300:
@@ -147,36 +287,235 @@ async def make_digest() -> str | None:
             content = build_content(sections, limit)
 
         token = await ensure_telegraph_account(session)
-        title = f"Сводка новостей — {datetime.now(MOSCOW).strftime('%d.%m, %H:%M')}"
+        title = f"Сводка новостей — {now_msk().strftime('%d.%m, %H:%M')}"
         while True:
             try:
                 page = await telegraph_call(session, "createPage", {
-                    "access_token": token,
-                    "title": title,
-                    "author_name": "botkaracikov",
-                    "content": content,
+                    "access_token": token, "title": title,
+                    "author_name": "botkaracikov", "content": content,
                 })
-                break
+                return page["url"]
             except RuntimeError as e:
-                # Если всё равно слишком большая — сокращаем ещё вдвое и пробуем снова
                 if "CONTENT_TOO_BIG" not in str(e) or limit <= 300:
                     raise
                 limit //= 2
                 content = build_content(sections, limit)
-    return page["url"]
+
+
+# ======================= Кнопки =======================
+
+BTN_TODAY = "📅 Сегодня"
+BTN_TOMORROW = "📆 Завтра"
+BTN_WEEK = "🗓 Неделя"
+BTN_OTR = "📝 Отработки"
+BTN_NEWS = "📰 Новости"
+BTN_SETTINGS = "🔔 Уведомления"
+
+MAIN_KB = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW), KeyboardButton(text=BTN_WEEK)],
+        [KeyboardButton(text=BTN_OTR), KeyboardButton(text=BTN_NEWS), KeyboardButton(text=BTN_SETTINGS)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
+def week_kb(monday: date) -> InlineKeyboardMarkup:
+    prev_m, next_m = monday - timedelta(days=7), monday + timedelta(days=7)
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀️", callback_data=f"wk:{prev_m.isoformat()}"),
+        InlineKeyboardButton(text="Эта неделя", callback_data="wk:now"),
+        InlineKeyboardButton(text="▶️", callback_data=f"wk:{next_m.isoformat()}"),
+    ]])
+
+
+def settings_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
+    kb = [[InlineKeyboardButton(text=("✅ " if user["notify"][k] else "❌ ") + name, callback_data=f"st:{k}")]
+          for k, name in NOTIFY_NAMES.items()]
+    text = "🔔 <b>Уведомления</b>\nНажми, чтобы включить или выключить:"
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# ======================= Команды и кнопки =======================
+
+async def ensure_schedule():
+    global lessons, schedule_loaded_at
+    if not lessons:
+        lessons = await fetch_schedule()
+        schedule_loaded_at = now_msk()
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    get_user(message.from_user.id)
+    save_data()
     await message.answer(
-        "Привет! Я собираю свежие новости в одну статью, "
-        "которую можно читать прямо в Telegram.\n\n"
-        "/news — получить свежую сводку",
-        parse_mode="HTML"
+        "Привет! Я присылаю расписание и напоминания:\n"
+        f"• вечером в {EVENING_HOUR}:00 — пары на завтра и ближайшие зачёты;\n"
+        f"• за {REMIND_BEFORE_MIN} минут до каждой пары;\n"
+        "• про незакрытые отработки;\n"
+        "• если расписание на сайте изменилось.\n\n"
+        "Кнопки внизу — расписание, отработки, новости и настройки уведомлений.",
+        reply_markup=MAIN_KB,
     )
 
 
+@dp.message(Command("today"))
+@dp.message(F.text == BTN_TODAY)
+async def show_today(message: types.Message):
+    await ensure_schedule()
+    await message.answer(day_text(now_msk().date()), parse_mode="HTML", reply_markup=MAIN_KB)
+
+
+@dp.message(Command("tomorrow"))
+@dp.message(F.text == BTN_TOMORROW)
+async def show_tomorrow(message: types.Message):
+    await ensure_schedule()
+    await message.answer(day_text(now_msk().date() + timedelta(days=1)), parse_mode="HTML", reply_markup=MAIN_KB)
+
+
+@dp.message(Command("week"))
+@dp.message(F.text == BTN_WEEK)
+async def show_week(message: types.Message):
+    await ensure_schedule()
+    today = now_msk().date()
+    monday = today - timedelta(days=today.weekday())
+    await message.answer(week_text(monday), parse_mode="HTML", reply_markup=week_kb(monday))
+
+
+@dp.callback_query(F.data.startswith("wk:"))
+async def cb_week(call: types.CallbackQuery):
+    await ensure_schedule()
+    arg = call.data[3:]
+    today = now_msk().date()
+    monday = today - timedelta(days=today.weekday()) if arg == "now" else date.fromisoformat(arg)
+    try:
+        await call.message.edit_text(week_text(monday), parse_mode="HTML", reply_markup=week_kb(monday))
+    except Exception:
+        pass
+    await call.answer()
+
+
+@dp.message(Command("otr"))
+@dp.message(F.text == BTN_OTR)
+async def show_otr(message: types.Message):
+    text, kb = otr_view(get_user(message.from_user.id))
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "oa")
+async def cb_otr_add(call: types.CallbackQuery):
+    """Шаг 1: выбор дня, в который был пропуск (последние 14 дней с парами)."""
+    await ensure_schedule()
+    today = now_msk().date()
+    days = sorted({x.day for x in lessons if today - timedelta(days=14) <= x.day <= today}, reverse=True)
+    if not days:
+        await call.answer("За последние две недели пар не было", show_alert=True)
+        return
+    kb = [[InlineKeyboardButton(text=f"{DOW_S[d.weekday()]}, {d.day} {MON[d.month - 1]}",
+                                callback_data=f"oad:{d.isoformat()}")] for d in days]
+    kb.append([InlineKeyboardButton(text="« Назад", callback_data="ob")])
+    await call.message.edit_text("В какой день был пропуск?", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("oad:"))
+async def cb_otr_add_day(call: types.CallbackQuery):
+    """Шаг 2: выбор пары в этот день."""
+    day = date.fromisoformat(call.data[4:])
+    kb = [[InlineKeyboardButton(text=f"{x.start} {x.subject[:30]} ({x.kind[:12]})",
+                                callback_data=f"oal:{day.isoformat()}|{x.start}")] for x in lessons_on(day)]
+    kb.append([InlineKeyboardButton(text="« Назад", callback_data="oa")])
+    await call.message.edit_text(f"Какую пару пропустил — {day_title(day)}?",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("oal:"))
+async def cb_otr_add_lesson(call: types.CallbackQuery):
+    d, t = call.data[4:].split("|")
+    lesson = next((x for x in lessons_on(date.fromisoformat(d)) if x.start == t), None)
+    if not lesson:
+        await call.answer("Пара не найдена", show_alert=True)
+        return
+    user = get_user(call.from_user.id)
+    if not any(o["d"] == d and o["t"] == t for o in user["otr"]):
+        user["otr"].append({"id": uuid.uuid4().hex[:8], "d": d, "t": t, "subj": lesson.subject,
+                            "kind": lesson.kind, "teacher": lesson.teacher, "done": False})
+        user["otr"].sort(key=lambda o: (o["d"], o["t"]))
+        save_data()
+    text, kb = otr_view(user)
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer("Пропуск добавлен")
+
+
+@dp.callback_query(F.data.startswith("od:"))
+async def cb_otr_done(call: types.CallbackQuery):
+    user = get_user(call.from_user.id)
+    for o in user["otr"]:
+        if o["id"] == call.data[3:]:
+            o["done"] = True
+            o["done_date"] = now_msk().date().isoformat()
+    save_data()
+    text, kb = otr_view(user)
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer("Отмечено как отработанное ✅")
+
+
+@dp.callback_query(F.data == "ou")
+async def cb_otr_undo_list(call: types.CallbackQuery):
+    user = get_user(call.from_user.id)
+    done = [o for o in user["otr"] if o.get("done")]
+    kb = [[InlineKeyboardButton(text=f"↩️ {o['subj'][:28]} {o['d'][8:]}.{o['d'][5:7]}",
+                                callback_data=f"ouu:{o['id']}")] for o in done]
+    kb.append([InlineKeyboardButton(text="« Назад", callback_data="ob")])
+    await call.message.edit_text("Какую вернуть в «нужно отработать»?",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("ouu:"))
+async def cb_otr_undo(call: types.CallbackQuery):
+    user = get_user(call.from_user.id)
+    for o in user["otr"]:
+        if o["id"] == call.data[4:]:
+            o["done"] = False
+            o.pop("done_date", None)
+    save_data()
+    text, kb = otr_view(user)
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "ob")
+async def cb_otr_back(call: types.CallbackQuery):
+    text, kb = otr_view(get_user(call.from_user.id))
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+
+@dp.message(Command("settings"))
+@dp.message(F.text == BTN_SETTINGS)
+async def show_settings(message: types.Message):
+    text, kb = settings_view(get_user(message.from_user.id))
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("st:"))
+async def cb_settings(call: types.CallbackQuery):
+    user = get_user(call.from_user.id)
+    k = call.data[3:]
+    if k in user["notify"]:
+        user["notify"][k] = not user["notify"][k]
+        save_data()
+    text, kb = settings_view(user)
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer()
+
+
 @dp.message(Command("news"))
+@dp.message(F.text == BTN_NEWS)
 async def cmd_news(message: types.Message):
     status = await message.answer("Собираю свежие новости...")
     try:
@@ -184,22 +523,139 @@ async def cmd_news(message: types.Message):
     except Exception as e:
         logging.error(f"Не удалось собрать сводку: {e}")
         page_url = None
-
     if not page_url:
         await status.edit_text("Не удалось загрузить новости. Попробуй чуть позже.")
         return
+    # Одно сообщение: заголовок ведёт на статью Telegraph, в превью — кнопка «Посмотреть»
+    await status.edit_text(f"📰 <a href='{page_url}'>Сводка новостей</a>", parse_mode="HTML")
 
-    # Одно сообщение: заголовок скрыто ведёт на статью, в превью — кнопка «Посмотреть»
-    await status.edit_text(
-        f"📰 <a href='{page_url}'>Сводка новостей</a>",
-        parse_mode="HTML",
-    )
+
+# ======================= Фоновые уведомления =======================
+
+def already_sent(key: str) -> bool:
+    if key in data["sent"]:
+        return True
+    data["sent"].append(key)
+    return False
+
+
+async def send_to(uid: str, text: str):
+    try:
+        await bot.send_message(int(uid), text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logging.error(f"Не удалось отправить {uid}: {e}")
+
+
+def evening_text(user: dict) -> str:
+    tomorrow = now_msk().date() + timedelta(days=1)
+    parts = []
+    if user["notify"]["evening"]:
+        parts.append("🌙 <b>Пары на завтра</b>\n\n" + day_text(tomorrow))
+        exams = [x for x in upcoming_exams(7) if x.day > tomorrow]
+        if exams:
+            parts.append("❗️ <b>Скоро:</b>\n" + "\n".join(
+                f"• {x.day.day} {MON[x.day.month - 1]} — {esc(x.kind)}: {esc(x.subject)}" for x in exams))
+    opened = open_otr(user)
+    if user["notify"]["otr"] and opened:
+        parts.append(f"📝 <b>Незакрытые отработки: {len(opened)}</b>\n" +
+                     "\n".join(f"• {otr_line(o)}" for o in opened))
+    return "\n\n".join(parts)
+
+
+def snapshot(items: list[Lesson]) -> dict[str, set]:
+    today = now_msk().date()
+    snap: dict[str, set] = {}
+    for x in items:
+        if today <= x.day <= today + timedelta(days=14):
+            snap.setdefault(x.day.isoformat(), set()).add((x.start, x.subject, x.kind, x.teacher))
+    return snap
+
+
+def diff_text(old: dict, new: dict) -> str:
+    parts = []
+    for d in sorted(set(old) | set(new)):
+        removed = old.get(d, set()) - new.get(d, set())
+        added = new.get(d, set()) - old.get(d, set())
+        if not removed and not added:
+            continue
+        lines = [f"<b>{day_title(date.fromisoformat(d))}</b>"]
+        lines += [f"➖ <s>{t} {esc(s)} ({esc(k)})</s>" for t, s, k, _ in sorted(removed)]
+        lines += [f"➕ {t} {esc(s)} ({esc(k)}) · {esc(te)}" for t, s, k, te in sorted(added)]
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+
+async def refresh_schedule():
+    """Перечитывает сайт и рассылает изменения на ближайшие 2 недели."""
+    global lessons, schedule_loaded_at
+    schedule_loaded_at = now_msk()
+    try:
+        new = await fetch_schedule()
+    except Exception as e:
+        logging.error(f"Не удалось обновить расписание: {e}")
+        return
+    if lessons:
+        changes = diff_text(snapshot(lessons), snapshot(new))
+        if changes:
+            for uid in list(data["users"]):
+                if get_user(int(uid))["notify"]["changes"]:
+                    await send_to(uid, "✏️ <b>Расписание изменилось</b>\n\n" + changes)
+    lessons = new
+
+
+async def notifier():
+    while True:
+        try:
+            now = now_msk()
+            if not schedule_loaded_at or now - schedule_loaded_at >= timedelta(minutes=SCHEDULE_REFRESH_MIN):
+                await refresh_schedule()
+
+            changed = False
+            # Вечерняя сводка: пары на завтра, ближайшие зачёты, незакрытые отработки
+            if now.hour == EVENING_HOUR and not already_sent(f"evening:{now.date()}"):
+                changed = True
+                for uid in list(data["users"]):
+                    text = evening_text(get_user(int(uid)))
+                    if text:
+                        await send_to(uid, text)
+
+            # Напоминание перед парой
+            for x in lessons_on(now.date()):
+                delta = x.start_dt - now
+                if timedelta(0) < delta <= timedelta(minutes=REMIND_BEFORE_MIN):
+                    if already_sent(f"before:{x.day}:{x.start}"):
+                        continue
+                    changed = True
+                    mins = max(1, -(-int(delta.total_seconds()) // 60))  # округляем вверх
+                    text = f"⏰ <b>Через {mins} мин</b>\n\n{lesson_line(x)}"
+                    for uid in list(data["users"]):
+                        if get_user(int(uid))["notify"]["before"]:
+                            await send_to(uid, text)
+            if changed:
+                save_data()
+        except Exception as e:
+            logging.exception(f"Ошибка в уведомлениях: {e}")
+        await asyncio.sleep(30)
 
 
 async def main():
     if not BOT_TOKEN:
         raise ValueError("Не задана переменная окружения BOT_TOKEN!")
 
+    load_data()
+    await refresh_schedule()
+    logging.info(f"Расписание загружено: {len(lessons)} пар")
+
+    await bot.set_my_commands([
+        BotCommand(command="today", description="Пары сегодня"),
+        BotCommand(command="tomorrow", description="Пары завтра"),
+        BotCommand(command="week", description="Расписание на неделю"),
+        BotCommand(command="otr", description="Отработки"),
+        BotCommand(command="news", description="Сводка новостей"),
+        BotCommand(command="settings", description="Настройка уведомлений"),
+    ])
+
+    asyncio.create_task(notifier())
     logging.info("Бот запущен!")
     await dp.start_polling(bot)
 
