@@ -29,6 +29,7 @@ MOSCOW = timezone(timedelta(hours=3))
 EVENING_HOUR = 20          # во сколько присылать расписание на завтра
 REMIND_BEFORE_MIN = 15     # за сколько минут напоминать о паре
 SCHEDULE_REFRESH_MIN = 30  # как часто перечитывать сайт с расписанием
+NEWS_TIMES = ["07:30", "14:00", "17:30", "22:00"]  # когда присылать сводку новостей
 EXAM_KINDS = {"Экзамен", "Зачёт", "Зачёт (письменный)", "Дифференцированный зачёт", "Контрольная работа"}
 
 # Данные пользователей храним в JSON. На Bothost папка /app/shared не стирается при обновлении бота.
@@ -47,12 +48,13 @@ def now_msk() -> datetime:
 
 # ======================= Хранилище =======================
 
-NOTIFY_DEFAULTS = {"evening": True, "before": True, "otr": True, "changes": True}
+NOTIFY_DEFAULTS = {"evening": True, "before": True, "otr": True, "changes": True, "news": True}
 NOTIFY_NAMES = {
     "evening": f"Расписание на завтра в {EVENING_HOUR}:00",
     "before": f"За {REMIND_BEFORE_MIN} минут до пары",
     "otr": "Незакрытые отработки",
     "changes": "Изменения в расписании",
+    "news": "Новости в " + ", ".join(NEWS_TIMES),
 }
 
 data: dict = {"users": {}, "sent": []}
@@ -134,23 +136,6 @@ def day_text(day: date, with_topic: bool = True) -> str:
     if not items:
         return f"{head}\nПар нет 🎉"
     return head + "\n\n" + "\n\n".join(lesson_line(x, with_topic) for x in items)
-
-
-def week_text(start: date) -> str:
-    monday = start - timedelta(days=start.weekday())
-    sunday = monday + timedelta(days=6)
-    parts = [f"🗓 <b>Неделя {monday.day} {MON[monday.month - 1]} – {sunday.day} {MON[sunday.month - 1]}</b>"]
-    for i in range(7):
-        day = monday + timedelta(days=i)
-        items = lessons_on(day)
-        if not items:
-            continue
-        rows = [f"{x.start} {'❗️' if x.kind in EXAM_KINDS else ''}{esc(x.subject)} <i>({esc(x.kind)})</i>"
-                for x in items]
-        parts.append(f"<b>{DOW_S[i]}, {day.day} {MON[day.month - 1]}</b>\n" + "\n".join(rows))
-    if len(parts) == 1:
-        parts.append("На этой неделе пар нет 🎉")
-    return "\n\n".join(parts)
 
 
 def upcoming_exams(days: int = 7) -> list[Lesson]:
@@ -304,30 +289,17 @@ async def make_digest() -> str | None:
 
 # ======================= Кнопки =======================
 
-BTN_TODAY = "📅 Сегодня"
-BTN_TOMORROW = "📆 Завтра"
-BTN_WEEK = "🗓 Неделя"
 BTN_OTR = "📝 Отработки"
 BTN_NEWS = "📰 Новости"
 BTN_SETTINGS = "🔔 Уведомления"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_TOMORROW), KeyboardButton(text=BTN_WEEK)],
         [KeyboardButton(text=BTN_OTR), KeyboardButton(text=BTN_NEWS), KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
-
-
-def week_kb(monday: date) -> InlineKeyboardMarkup:
-    prev_m, next_m = monday - timedelta(days=7), monday + timedelta(days=7)
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="◀️", callback_data=f"wk:{prev_m.isoformat()}"),
-        InlineKeyboardButton(text="Эта неделя", callback_data="wk:now"),
-        InlineKeyboardButton(text="▶️", callback_data=f"wk:{next_m.isoformat()}"),
-    ]])
 
 
 def settings_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
@@ -351,50 +323,15 @@ async def cmd_start(message: types.Message):
     get_user(message.from_user.id)
     save_data()
     await message.answer(
-        "Привет! Я присылаю расписание и напоминания:\n"
+        "Привет! Я присылаю уведомления:\n"
         f"• вечером в {EVENING_HOUR}:00 — пары на завтра и ближайшие зачёты;\n"
         f"• за {REMIND_BEFORE_MIN} минут до каждой пары;\n"
         "• про незакрытые отработки;\n"
-        "• если расписание на сайте изменилось.\n\n"
-        "Кнопки внизу — расписание, отработки, новости и настройки уведомлений.",
+        "• если расписание на сайте изменилось;\n"
+        f"• сводку новостей в {', '.join(NEWS_TIMES)}.\n\n"
+        "Кнопки внизу — отработки, новости и настройка уведомлений.",
         reply_markup=MAIN_KB,
     )
-
-
-@dp.message(Command("today"))
-@dp.message(F.text == BTN_TODAY)
-async def show_today(message: types.Message):
-    await ensure_schedule()
-    await message.answer(day_text(now_msk().date()), parse_mode="HTML", reply_markup=MAIN_KB)
-
-
-@dp.message(Command("tomorrow"))
-@dp.message(F.text == BTN_TOMORROW)
-async def show_tomorrow(message: types.Message):
-    await ensure_schedule()
-    await message.answer(day_text(now_msk().date() + timedelta(days=1)), parse_mode="HTML", reply_markup=MAIN_KB)
-
-
-@dp.message(Command("week"))
-@dp.message(F.text == BTN_WEEK)
-async def show_week(message: types.Message):
-    await ensure_schedule()
-    today = now_msk().date()
-    monday = today - timedelta(days=today.weekday())
-    await message.answer(week_text(monday), parse_mode="HTML", reply_markup=week_kb(monday))
-
-
-@dp.callback_query(F.data.startswith("wk:"))
-async def cb_week(call: types.CallbackQuery):
-    await ensure_schedule()
-    arg = call.data[3:]
-    today = now_msk().date()
-    monday = today - timedelta(days=today.weekday()) if arg == "now" else date.fromisoformat(arg)
-    try:
-        await call.message.edit_text(week_text(monday), parse_mode="HTML", reply_markup=week_kb(monday))
-    except Exception:
-        pass
-    await call.answer()
 
 
 @dp.message(Command("otr"))
@@ -539,9 +476,9 @@ def already_sent(key: str) -> bool:
     return False
 
 
-async def send_to(uid: str, text: str):
+async def send_to(uid: str, text: str, preview: bool = False):
     try:
-        await bot.send_message(int(uid), text, parse_mode="HTML", disable_web_page_preview=True)
+        await bot.send_message(int(uid), text, parse_mode="HTML", disable_web_page_preview=not preview)
     except Exception as e:
         logging.error(f"Не удалось отправить {uid}: {e}")
 
@@ -603,6 +540,20 @@ async def refresh_schedule():
     lessons = new
 
 
+async def send_news_to_all():
+    users = [uid for uid in list(data["users"]) if get_user(int(uid))["notify"]["news"]]
+    if not users:
+        return
+    try:
+        page_url = await make_digest()
+    except Exception as e:
+        logging.error(f"Не удалось собрать сводку: {e}")
+        return
+    if page_url:
+        for uid in users:
+            await send_to(uid, f"📰 <a href='{page_url}'>Сводка новостей</a>", preview=True)
+
+
 async def notifier():
     while True:
         try:
@@ -631,6 +582,15 @@ async def notifier():
                     for uid in list(data["users"]):
                         if get_user(int(uid))["notify"]["before"]:
                             await send_to(uid, text)
+            # Сводка новостей по расписанию (окно 10 минут, чтобы не пропустить при перезапуске)
+            for hhmm in NEWS_TIMES:
+                h, m = map(int, hhmm.split(":"))
+                at = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if at <= now < at + timedelta(minutes=10) and not already_sent(f"news:{now.date()}:{hhmm}"):
+                    changed = True
+                    save_data()
+                    asyncio.create_task(send_news_to_all())
+
             if changed:
                 save_data()
         except Exception as e:
@@ -647,9 +607,6 @@ async def main():
     logging.info(f"Расписание загружено: {len(lessons)} пар")
 
     await bot.set_my_commands([
-        BotCommand(command="today", description="Пары сегодня"),
-        BotCommand(command="tomorrow", description="Пары завтра"),
-        BotCommand(command="week", description="Расписание на неделю"),
         BotCommand(command="otr", description="Отработки"),
         BotCommand(command="news", description="Сводка новостей"),
         BotCommand(command="settings", description="Настройка уведомлений"),
