@@ -179,13 +179,13 @@ def otr_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
 
 # ======================= Новости (Telegraph) =======================
 
-RSS_FEEDS = {
-    "Главные новости": "https://lenta.ru/rss/news",
-    "Технологии": "https://habr.com/ru/rss/news/?fl=ru",
-}
-SOURCE_NAMES = {"Главные новости": "Лента.ру", "Технологии": "Хабр"}
-NEWS_PER_SOURCE = 8        # сколько новостей брать из каждого источника
+RSS_FEEDS = [
+    "https://lenta.ru/rss/news",
+    "https://habr.com/ru/rss/news/?fl=ru",
+]
+NEWS_COUNT = 10            # сколько новостей в сводке
 SUMMARY_MAX_CHARS = 220    # длина краткого описания
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
 
 telegraph_token = TELEGRAPH_TOKEN
 
@@ -211,55 +211,69 @@ async def ensure_telegraph_account(session: aiohttp.ClientSession) -> str:
     return telegraph_token
 
 
-def short_summary(entry) -> str:
-    """Краткое описание новости из RSS: без HTML, 1–2 предложения."""
-    raw = entry.get("summary", "") or ""
-    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", raw))
+def clean_text(raw: str) -> str:
+    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", raw or ""))
     text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"\s*Читать далее.*$", "", text)
-    if len(text) <= SUMMARY_MAX_CHARS:
-        return text
-    cut = text[:SUMMARY_MAX_CHARS]
-    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
-    if end > SUMMARY_MAX_CHARS // 3:
-        return cut[:end + 1]
-    return cut.rsplit(" ", 1)[0] + "…"
+    return re.sub(r"\s*Читать далее.*$", "", text)
 
 
-def news_time(entry) -> str:
-    t = entry.get("published_parsed")
-    if not t:
+def shorten(text: str) -> str:
+    """Оставляет 1–2 предложения, не длиннее SUMMARY_MAX_CHARS."""
+    sentences = re.split(r"(?<=[.!?…])\s+(?=[А-ЯЁA-Z«\"0-9])", text)
+    text = " ".join(sentences[:2])
+    if len(text) > SUMMARY_MAX_CHARS:
+        first = sentences[0]
+        text = first if len(first) <= SUMMARY_MAX_CHARS else first[:SUMMARY_MAX_CHARS].rsplit(" ", 1)[0] + "…"
+    return text
+
+
+META_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]*>', re.I)
+CONTENT_RE = re.compile(r'content=["\']([^"\']*)["\']', re.I)
+
+
+async def page_description(session: aiohttp.ClientSession, url: str) -> str:
+    """Краткое описание из самой статьи (meta description)."""
+    try:
+        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            html = await resp.text()
+    except Exception as e:
+        logging.warning(f"Не удалось открыть {url}: {e}")
         return ""
-    dt = datetime(*t[:6], tzinfo=timezone.utc).astimezone(MOSCOW)
-    return dt.strftime("%H:%M")
+    for tag in META_RE.findall(html):
+        m = CONTENT_RE.search(tag)
+        if m and m.group(1).strip():
+            return clean_text(m.group(1))
+    return ""
+
+
+async def describe(session: aiohttp.ClientSession, entry) -> str:
+    title = entry.title.strip()
+    text = clean_text(entry.get("summary", ""))
+    if not text or text == title:
+        text = await page_description(session, entry.link)
+    return shorten(text) if text and text != title else ""
 
 
 async def make_digest() -> str | None:
-    """Собирает заголовки с кратким описанием в одну статью Telegraph и возвращает её адрес."""
-    content = []
-    total = 0
-    for category, url in RSS_FEEDS.items():
+    """10 самых свежих новостей: заголовок и 1–2 предложения, одной статьёй Telegraph."""
+    entries = []
+    for url in RSS_FEEDS:
         feed = await asyncio.to_thread(feedparser.parse, url)
-        entries = feed.entries[:NEWS_PER_SOURCE]
-        if not entries:
-            continue
-        content.append({"tag": "h3", "children": [category]})
-        for e in entries:
-            title = e.title.strip()
-            tm = news_time(e)
-            content.append({"tag": "h4", "children": [f"{tm} · {title}" if tm else title]})
-            summary = short_summary(e)
-            if summary and summary != title:
-                content.append({"tag": "p", "children": [summary]})
-            total += 1
-        content.append({"tag": "p", "children": [
-            {"tag": "i", "children": [f"Источник: {SOURCE_NAMES.get(category, category)}"]}
-        ]})
-        content.append({"tag": "hr"})
-    if not total:
+        entries += feed.entries
+    if not entries:
         return None
+    entries.sort(key=lambda e: tuple(e.get("published_parsed") or (0,) * 9), reverse=True)
+    entries = entries[:NEWS_COUNT]
 
     async with aiohttp.ClientSession() as session:
+        summaries = await asyncio.gather(*(describe(session, e) for e in entries))
+        content = []
+        for e, summary in zip(entries, summaries):
+            content.append({"tag": "h4", "children": [e.title.strip()]})
+            if summary:
+                content.append({"tag": "p", "children": [summary]})
+
         token = await ensure_telegraph_account(session)
         page = await telegraph_call(session, "createPage", {
             "access_token": token,
