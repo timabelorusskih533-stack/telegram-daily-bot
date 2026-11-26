@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 
 from schedule import SITE_URL, Lesson, parse_schedule
+import spy
 
 # Токен подтянется из настроек хостинга (Environment Variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -588,6 +589,10 @@ async def notifier():
                     save_data()
                     asyncio.create_task(send_news_to_all())
 
+            if not already_sent(f"cleanup:{now.date()}"):
+                changed = True
+                spy.cleanup()
+
             if changed:
                 save_data()
         except Exception as e:
@@ -600,6 +605,9 @@ async def main():
         raise ValueError("Не задана переменная окружения BOT_TOKEN!")
 
     load_data()
+    spy.init_db(DATA_DIR)
+    spy.cleanup()
+    dp.include_router(spy.router)
     await refresh_schedule()
     logging.info(f"Расписание загружено: {len(lessons)} пар")
 
@@ -611,7 +619,7 @@ async def main():
 
     asyncio.create_task(notifier())
     logging.info("Бот запущен!")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 if __name__ == "__main__":
