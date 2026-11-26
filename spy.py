@@ -32,6 +32,8 @@ def init_db(data_dir: str):
             text TEXT, media_type TEXT, file_id TEXT, saved_at INTEGER,
             PRIMARY KEY (chat_id, msg_id));
         CREATE INDEX IF NOT EXISTS idx_saved ON messages(saved_at);
+        CREATE TABLE IF NOT EXISTS caught (
+            chat_id INTEGER, msg_id INTEGER, PRIMARY KEY (chat_id, msg_id));
     """)
     db.commit()
 
@@ -120,7 +122,10 @@ async def send_media(bot: Bot, owner: int, media_type: str, file_id: str, captio
 async def on_connection(conn: BusinessConnection, bot: Bot):
     save_connection(conn)
     text = ("✅ <b>Бот подключён к твоим чатам.</b>\nБуду присылать удалённые и изменённые сообщения "
-            f"собеседников. Копии хранятся {KEEP_DAYS} дней."
+            f"собеседников. Копии хранятся {KEEP_DAYS} дней.\n\n"
+            "📥 <b>Одноразовые медиа:</b> не открывая фото/видео/голосовое, ответь на него "
+            "любым текстом — пришлю копию. Ответь словом «сии» — твой ответ сразу удалится, "
+            "собеседник ничего не заметит."
             if conn.is_enabled else "⛔️ Бот отключён от твоих чатов.")
     try:
         await bot.send_message(conn.user_chat_id, text, parse_mode="HTML")
@@ -128,9 +133,49 @@ async def on_connection(conn: BusinessConnection, bot: Bot):
         logging.error(f"Не удалось уведомить о подключении: {e}")
 
 
+CATCH_TYPES = ("photo", "video", "voice", "video_note")
+SILENT_WORD = "сии"
+
+
 @router.business_message()
-async def on_message(m: Message):
+async def on_message(m: Message, bot: Bot):
     save_message(m)
+    reply = m.reply_to_message
+    if not reply:
+        return
+    owner = await owner_of(bot, m.business_connection_id)
+    if not owner or not m.from_user or m.from_user.id != owner:
+        return
+    if reply.from_user and reply.from_user.id == owner:
+        return  # ответ на своё же медиа
+    await catch_media(bot, owner, m, reply)
+
+
+async def catch_media(bot: Bot, owner: int, m: Message, reply: Message):
+    """Ты ответил на медиа собеседника — присылаем копию (в т.ч. одноразовые фото и видео)."""
+    media_type, file_id = media_of(reply)
+    if media_type not in CATCH_TYPES or not file_id:
+        return
+    silent = (m.text or "").strip().lower() == SILENT_WORD
+    if silent:
+        # Удаляем твой ответ, чтобы собеседник ничего не заметил
+        try:
+            await bot.delete_business_messages(m.business_connection_id, [m.message_id])
+        except Exception as e:
+            logging.error(f"Не удалось удалить ответ: {e}")
+    if db.execute("SELECT 1 FROM caught WHERE chat_id=? AND msg_id=?",
+                  (reply.chat.id, reply.message_id)).fetchone():
+        return  # это медиа уже присылали
+    db.execute("INSERT INTO caught VALUES (?, ?)", (reply.chat.id, reply.message_id))
+    db.commit()
+    caption = f"📥 <b>Сохранил медиа</b> от {esc(person(reply.from_user))}"
+    if reply.caption:
+        caption += f"\n\n<blockquote>{esc(reply.caption)}</blockquote>"
+    try:
+        await send_media(bot, owner, media_type, file_id, caption[:1024])
+    except Exception as e:
+        logging.error(f"Не удалось переслать медиа: {e}")
+        await bot.send_message(owner, "⚠️ Не получилось сохранить это медиа — Telegram не отдал файл боту.")
 
 
 @router.edited_business_message()
