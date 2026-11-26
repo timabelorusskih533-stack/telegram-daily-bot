@@ -1,13 +1,14 @@
 import asyncio
+import html as html_lib
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 
 import aiohttp
 import feedparser
-import trafilatura
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import (
@@ -183,12 +184,10 @@ RSS_FEEDS = {
     "Технологии": "https://habr.com/ru/rss/news/?fl=ru",
 }
 SOURCE_NAMES = {"Главные новости": "Лента.ру", "Технологии": "Хабр"}
-NEWS_PER_SOURCE = 3
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
-MAX_CONTENT_BYTES = 40000  # у Telegraph лимит 64 КБ на статью, берём с запасом
+NEWS_PER_SOURCE = 8        # сколько новостей брать из каждого источника
+SUMMARY_MAX_CHARS = 220    # длина краткого описания
 
 telegraph_token = TELEGRAPH_TOKEN
-text_cache: dict[str, str] = {}
 
 
 async def telegraph_call(session: aiohttp.ClientSession, method: str, payload: dict) -> dict:
@@ -212,83 +211,63 @@ async def ensure_telegraph_account(session: aiohttp.ClientSession) -> str:
     return telegraph_token
 
 
-def paragraphs(text: str, limit: int) -> list:
-    if len(text) > limit:
-        cut = text[:limit]
-        # Обрезаем по концу предложения, чтобы не обрывать на полуслове
-        end = max(cut.rfind(". "), cut.rfind(".\n"))
-        text = (cut[:end + 1] if end > limit // 2 else cut) + " …"
-    return [{"tag": "p", "children": [p.strip()]} for p in text.split("\n") if p.strip()]
+def short_summary(entry) -> str:
+    """Краткое описание новости из RSS: без HTML, 1–2 предложения."""
+    raw = entry.get("summary", "") or ""
+    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", raw))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s*Читать далее.*$", "", text)
+    if len(text) <= SUMMARY_MAX_CHARS:
+        return text
+    cut = text[:SUMMARY_MAX_CHARS]
+    end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+    if end > SUMMARY_MAX_CHARS // 3:
+        return cut[:end + 1]
+    return cut.rsplit(" ", 1)[0] + "…"
 
 
-def build_content(sections: list, limit: int) -> list:
+def news_time(entry) -> str:
+    t = entry.get("published_parsed")
+    if not t:
+        return ""
+    dt = datetime(*t[:6], tzinfo=timezone.utc).astimezone(MOSCOW)
+    return dt.strftime("%H:%M")
+
+
+async def make_digest() -> str | None:
+    """Собирает заголовки с кратким описанием в одну статью Telegraph и возвращает её адрес."""
     content = []
-    for category, items in sections:
+    total = 0
+    for category, url in RSS_FEEDS.items():
+        feed = await asyncio.to_thread(feedparser.parse, url)
+        entries = feed.entries[:NEWS_PER_SOURCE]
+        if not entries:
+            continue
         content.append({"tag": "h3", "children": [category]})
-        for title, text in items:
-            content.append({"tag": "h4", "children": [title]})
-            content.extend(paragraphs(text, limit))
+        for e in entries:
+            title = e.title.strip()
+            tm = news_time(e)
+            content.append({"tag": "h4", "children": [f"{tm} · {title}" if tm else title]})
+            summary = short_summary(e)
+            if summary and summary != title:
+                content.append({"tag": "p", "children": [summary]})
+            total += 1
         content.append({"tag": "p", "children": [
             {"tag": "i", "children": [f"Источник: {SOURCE_NAMES.get(category, category)}"]}
         ]})
         content.append({"tag": "hr"})
-    return content
+    if not total:
+        return None
 
-
-def content_size(content: list) -> int:
-    return len(json.dumps(content, ensure_ascii=False).encode("utf-8"))
-
-
-async def get_full_text(session: aiohttp.ClientSession, entry) -> str:
-    link = entry.link
-    if link in text_cache:
-        return text_cache[link]
-    text = None
-    try:
-        async with session.get(link, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            html = await resp.text()
-        text = await asyncio.to_thread(trafilatura.extract, html, include_comments=False, include_tables=False)
-    except Exception as e:
-        logging.warning(f"Не удалось скачать статью {link}: {e}")
-    if not text:
-        summary = entry.get("summary", "")
-        text = trafilatura.extract(f"<html><body><p>{summary}</p></body></html>") or summary or ""
-    text_cache[link] = text
-    return text
-
-
-async def make_digest() -> str | None:
-    """Собирает все новости в одну статью Telegraph и возвращает её адрес."""
-    sections = []
     async with aiohttp.ClientSession() as session:
-        for category, url in RSS_FEEDS.items():
-            feed = await asyncio.to_thread(feedparser.parse, url)
-            items = [(e.title, await get_full_text(session, e)) for e in feed.entries[:NEWS_PER_SOURCE]]
-            if items:
-                sections.append((category, items))
-        if not sections:
-            return None
-
-        limit = 6000
-        content = build_content(sections, limit)
-        while content_size(content) > MAX_CONTENT_BYTES and limit > 300:
-            limit = int(limit * 0.8)
-            content = build_content(sections, limit)
-
         token = await ensure_telegraph_account(session)
-        title = f"Сводка новостей — {now_msk().strftime('%d.%m, %H:%M')}"
-        while True:
-            try:
-                page = await telegraph_call(session, "createPage", {
-                    "access_token": token, "title": title,
-                    "author_name": "botkaracikov", "content": content,
-                })
-                return page["url"]
-            except RuntimeError as e:
-                if "CONTENT_TOO_BIG" not in str(e) or limit <= 300:
-                    raise
-                limit //= 2
-                content = build_content(sections, limit)
+        page = await telegraph_call(session, "createPage", {
+            "access_token": token,
+            "title": f"Сводка новостей — {now_msk().strftime('%d.%m, %H:%M')}",
+            "author_name": "botkaracikov",
+            "content": content,
+        })
+    return page["url"]
 
 
 # ======================= Кнопки =======================
