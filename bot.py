@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 
 from schedule import SITE_URL, Lesson, parse_schedule
+import voice
 
 # Токен подтянется из настроек хостинга (Environment Variables)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -498,6 +499,7 @@ def _rem_time(s: str):
     for pat, kind in [
         (r'\b(?:в|к|во)\s+(\d{1,2})[:.](\d{2})', "hm"),
         (r'\b(\d{1,2})[:.](\d{2})\b', "hm"),
+        (r'\b(?:в|к|во)\s+(\d{1,2})\s+(\d{2})\b', "hm"),
         (r'\b(?:в|к|во)\s+(\d{1,2})\s*(утра|дня|вечера|ночи)\b', "hp"),
         (r'\b(\d{1,2})\s*(утра|дня|вечера|ночи)\b', "hp"),
         (r'\b(?:в|к|во)\s+(\d{1,2})\s*(?:час\w*|ч)\b', "h"),
@@ -560,6 +562,36 @@ def _rem_day(s: str, now: datetime):
 def _rem_body(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip(" ,.;:-—")
     return re.sub(r"^(что|чтобы|о том,?\s*что|про|о|об|надо|нужно)\s+", "", s, flags=re.I).strip()
+
+
+REM_UNITS = {"ноль": 0, "один": 1, "одна": 1, "одно": 1, "два": 2, "две": 2, "три": 3, "четыре": 4,
+    "пять": 5, "шесть": 6, "семь": 7, "восемь": 8, "девять": 9, "десять": 10, "одиннадцать": 11,
+    "двенадцать": 12, "тринадцать": 13, "четырнадцать": 14, "пятнадцать": 15, "шестнадцать": 16,
+    "семнадцать": 17, "восемнадцать": 18, "девятнадцать": 19}
+REM_TENS = {"двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50, "шестьдесят": 60}
+
+
+def words_to_num(text: str) -> str:
+    """Числительные словами -> цифры: «двенадцать тридцать» -> «12 30» (для голосовых)."""
+    words = text.split()
+    out = []
+    i = 0
+    while i < len(words):
+        w = words[i].lower()
+        if w in REM_TENS:
+            val = REM_TENS[w]
+            if i + 1 < len(words) and words[i + 1].lower() in REM_UNITS and REM_UNITS[words[i + 1].lower()] < 10:
+                val += REM_UNITS[words[i + 1].lower()]
+                i += 1
+            out.append(str(val))
+        elif w in REM_UNITS:
+            out.append(str(REM_UNITS[w]))
+        else:
+            out.append(words[i])
+        i += 1
+    res = " ".join(out)
+    res = re.sub(r"\b(\d{1,2}) 0 0\b", r"\1 00", res)   # «двенадцать ноль ноль» -> «12 00»
+    return res
 
 
 def parse_reminder(text: str, now: datetime | None = None):
@@ -834,6 +866,43 @@ def add_reminder(message: types.Message) -> bool:
     return True
 
 
+@dp.message(F.voice | F.audio)
+async def on_voice(message: types.Message, bot: Bot):
+    if not voice.model_ready():
+        hint = ("🎧 Распознавание голоса ещё загружается, попробуй через минуту."
+                if voice.is_loading() else
+                "🎧 Распознавание голоса сейчас недоступно.")
+        await message.answer(hint + "\nМожно пока написать текстом: <i>напомни завтра в 12:00 ...</i>",
+                             parse_mode="HTML", reply_markup=MAIN_KB)
+        return
+    status = await message.answer("🎧 Слушаю…")
+    try:
+        obj = message.voice or message.audio
+        f = await bot.get_file(obj.file_id)
+        bio = await bot.download_file(f.file_path)
+        text = await voice.transcribe(bio.read())
+    except Exception as e:
+        logging.error(f"Голосовое: {e}")
+        text = ""
+    if not text:
+        await status.edit_text("Не разобрал 🙉 Скажи чуть чётче или напиши текстом.")
+        return
+    when, body = parse_reminder(words_to_num(text), now_msk())
+    if not when:
+        await status.edit_text(
+            f"🎙 Расслышал: «{esc(text)}»\n\nНо не понял, когда напомнить. "
+            "Скажи с временем, например «напомни завтра в двенадцать позвонить маме».",
+            parse_mode="HTML")
+        return
+    user = get_user(message.from_user.id)
+    user["reminders"].append({"id": uuid.uuid4().hex[:8], "when": when.isoformat(),
+                              "text": body or "Напоминание"})
+    save_data()
+    await status.edit_text(
+        f"🎙 Расслышал: «{esc(text)}»\n\n✅ Напомню <b>{when_text(when)}</b>:\n{esc(body or 'Напоминание')}",
+        parse_mode="HTML")
+
+
 @dp.message(F.text.regexp(r"^(?i:напомни|напоминание|ремайнд)"))
 async def on_reminder_text(message: types.Message):
     when, body = parse_reminder(message.text, now_msk())
@@ -1071,6 +1140,7 @@ async def main():
         raise ValueError("Не задана переменная окружения BOT_TOKEN!")
 
     load_data()
+    asyncio.create_task(voice.ensure_model(DATA_DIR))
     await refresh_schedule()
     logging.info(f"Расписание загружено: {len(lessons)} пар")
 
