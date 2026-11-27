@@ -249,32 +249,60 @@ def shorten(text: str) -> str:
     return text
 
 
-META_RE = re.compile(
+DESC_RE = re.compile(
     r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]*>', re.I)
+IMAGE_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\'](?:og:image|og:image:url|twitter:image)["\'][^>]*>', re.I)
 CONTENT_RE = re.compile(r'content=["\']([^"\']*)["\']', re.I)
 
 
-async def page_description(session: aiohttp.ClientSession, url: str) -> str:
-    """Краткое описание из самой статьи (meta description)."""
+def entry_image(entry) -> str:
+    """Картинка из RSS: media:content, media:thumbnail или enclosure."""
+    for key in ("media_content", "media_thumbnail"):
+        for item in entry.get(key, []) or []:
+            if item.get("url"):
+                return item["url"]
+    for link in entry.get("links", []) or []:
+        if link.get("rel") == "enclosure" and str(link.get("type", "")).startswith("image"):
+            return link.get("href", "")
+    return ""
+
+
+async def page_meta(session: aiohttp.ClientSession, url: str) -> tuple[str, str]:
+    """Описание и картинка со страницы статьи (og:description, og:image)."""
     try:
         async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             html = await resp.text()
     except Exception as e:
         logging.warning(f"Не удалось открыть {url}: {e}")
-        return ""
-    for tag in META_RE.findall(html):
+        return "", ""
+    desc = image = ""
+    for tag in DESC_RE.findall(html):
         m = CONTENT_RE.search(tag)
         if m and m.group(1).strip():
-            return clean_text(m.group(1))
-    return ""
+            desc = clean_text(m.group(1))
+            break
+    for tag in IMAGE_RE.findall(html):
+        m = CONTENT_RE.search(tag)
+        if m and m.group(1).strip():
+            image = m.group(1).strip()
+            break
+    return desc, image
 
 
-async def describe(session: aiohttp.ClientSession, entry) -> str:
+async def describe(session: aiohttp.ClientSession, entry) -> tuple[str, str]:
+    """Возвращает (краткое описание, ссылка на картинку)."""
     title = entry.title.strip()
     text = clean_text(entry.get("summary", ""))
-    if not text or text == title:
-        text = await page_description(session, entry.link)
-    return shorten(text) if text and text != title else ""
+    image = entry_image(entry)
+    if (not text or text == title) or not image:
+        page_desc, page_image = await page_meta(session, entry.link)
+        if not text or text == title:
+            text = page_desc
+        if not image:
+            image = page_image
+    summary = shorten(text) if text and text != title else ""
+    return summary, image
 
 
 async def make_digest() -> str | None:
@@ -289,21 +317,31 @@ async def make_digest() -> str | None:
     entries = entries[:NEWS_COUNT]
 
     async with aiohttp.ClientSession() as session:
-        summaries = await asyncio.gather(*(describe(session, e) for e in entries))
-        content = []
-        for e, summary in zip(entries, summaries):
-            content.append({"tag": "h4", "children": [e.title.strip()]})
-            if summary:
-                content.append({"tag": "p", "children": [summary]})
+        described = await asyncio.gather(*(describe(session, e) for e in entries))
+
+        def build(with_images: bool) -> list:
+            content = []
+            for e, (summary, image) in zip(entries, described):
+                if with_images and image:
+                    content.append({"tag": "figure", "children": [
+                        {"tag": "img", "attrs": {"src": image}}]})
+                content.append({"tag": "h4", "children": [e.title.strip()]})
+                if summary:
+                    content.append({"tag": "p", "children": [summary]})
+            return content
 
         token = await ensure_telegraph_account(session)
-        page = await telegraph_call(session, "createPage", {
-            "access_token": token,
-            "title": f"Сводка новостей — {now_msk().strftime('%d.%m, %H:%M')}",
-            "author_name": "botkaracikov",
-            "content": content,
-        })
-    return page["url"]
+        title = f"Сводка новостей — {now_msk().strftime('%d.%m, %H:%M')}"
+        for with_images in (True, False):
+            try:
+                page = await telegraph_call(session, "createPage", {
+                    "access_token": token, "title": title,
+                    "author_name": "botkaracikov", "content": build(with_images),
+                })
+                return page["url"]
+            except RuntimeError as e:
+                logging.warning(f"createPage (картинки={with_images}) не прошёл: {e}")
+        return None
 
 
 # ======================= Кнопки =======================
