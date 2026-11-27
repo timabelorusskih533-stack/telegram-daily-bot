@@ -312,6 +312,11 @@ async def telegraph_call(session: aiohttp.ClientSession, method: str, payload: d
     return result["result"]
 
 
+def reset_telegraph_token():
+    global telegraph_token
+    telegraph_token = None
+
+
 async def ensure_telegraph_account(session: aiohttp.ClientSession) -> str:
     global telegraph_token
     if not telegraph_token:
@@ -428,14 +433,21 @@ async def make_digest() -> str | None:
         token = await ensure_telegraph_account(session)
         title = f"Сводка новостей — {now_msk().strftime('%d.%m, %H:%M')}"
         for with_images in (True, False):
-            try:
-                page = await telegraph_call(session, "createPage", {
-                    "access_token": token, "title": title,
-                    "author_name": "botkaracikov", "content": build(with_images),
-                })
-                return page["url"]
-            except RuntimeError as e:
-                logging.warning(f"createPage (картинки={with_images}) не прошёл: {e}")
+            for attempt in range(2):
+                try:
+                    page = await telegraph_call(session, "createPage", {
+                        "access_token": token, "title": title,
+                        "author_name": "botkaracikov", "content": build(with_images),
+                    })
+                    return page["url"]
+                except RuntimeError as e:
+                    # Токен Telegraph слетел — создаём аккаунт заново и пробуем ещё раз
+                    if "ACCOUNT_NOT_FOUND" in str(e) and attempt == 0:
+                        reset_telegraph_token()
+                        token = await ensure_telegraph_account(session)
+                        continue
+                    logging.warning(f"createPage (картинки={with_images}) не прошёл: {e}")
+                    break
         return None
 
 
