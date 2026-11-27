@@ -127,20 +127,35 @@ def esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(n) % 100
+    if 11 <= n <= 14:
+        return many
+    d = n % 10
+    if d == 1:
+        return one
+    if 2 <= d <= 4:
+        return few
+    return many
+
+
 def lesson_line(x: Lesson, with_topic: bool = True) -> str:
-    mark = "❗️ " if x.kind in EXAM_KINDS else ""
-    line = f"<b>{x.start}–{x.end}</b> {mark}{esc(x.subject)}\n<i>{esc(x.kind)}</i> · {esc(x.teacher)}"
+    mark = "🔴 " if x.kind in EXAM_KINDS else "🕘 "
+    rows = [f"{mark}<b>{x.start}–{x.end}</b> · {esc(x.kind)}",
+            f"<b>{esc(x.subject)}</b>",
+            f"👤 {esc(x.teacher)}"]
     if with_topic and x.topic:
-        line += f"\n{esc(x.topic)}"
-    return line
+        rows.append(f"<i>{esc(x.topic)}</i>")
+    return "<blockquote>" + "\n".join(rows) + "</blockquote>"
 
 
 def day_text(day: date, with_topic: bool = True) -> str:
     items = lessons_on(day)
     head = f"📅 <b>{day_title(day)}</b>"
     if not items:
-        return f"{head}\nПар нет 🎉"
-    return head + "\n\n" + "\n\n".join(lesson_line(x, with_topic) for x in items)
+        return f"{head}\n\nПар нет 🎉"
+    tail = f"\n\n{len(items)} " + plural(len(items), "пара", "пары", "пар")
+    return head + "\n\n" + "\n".join(lesson_line(x, with_topic) for x in items) + tail
 
 
 def upcoming_exams(days: int = 7) -> list[Lesson]:
@@ -156,20 +171,27 @@ def open_otr(user: dict) -> list[dict]:
 
 def otr_line(o: dict) -> str:
     d = date.fromisoformat(o["d"])
-    return f"{d.day} {MON[d.month - 1]} {o['t']} — <b>{esc(o['subj'])}</b> <i>({esc(o['kind'])})</i>"
+    return ("<blockquote>"
+            f"📌 <b>{d.day} {MON[d.month - 1]}</b> · {o['t']}\n"
+            f"<b>{esc(o['subj'])}</b>\n"
+            f"{esc(o['kind'])}"
+            "</blockquote>")
 
 
 def otr_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
     opened = open_otr(user)
     done = [o for o in user["otr"] if o.get("done")]
-    text = f"📝 <b>Отработки</b>\nНе отработано: {len(opened)} · Отработано: {len(done)}"
     if opened:
-        text += "\n\n<b>Нужно отработать:</b>\n" + "\n".join(f"• {otr_line(o)}" for o in opened)
-    if done:
-        text += "\n\n<b>Отработано:</b>\n" + "\n".join(f"✅ {otr_line(o)}" for o in done[-10:])
-    if not user["otr"]:
-        text += "\n\nПока пусто. Нажми «Добавить пропуск», чтобы отметить пропущенную пару."
-    kb = [[InlineKeyboardButton(text=f"✓ Отработал: {o['subj'][:25]} {o['d'][8:]}.{o['d'][5:7]}",
+        n = len(opened)
+        text = (f"📝 <b>Отработки</b>\nНужно отработать: <b>{n}</b> "
+                + plural(n, "пара", "пары", "пар")
+                + "\n\n" + "\n".join(otr_line(o) for o in opened))
+    elif done:
+        text = "📝 <b>Отработки</b>\n\n✅ Всё отработано, долгов нет 🎉"
+    else:
+        text = ("📝 <b>Отработки</b>\n\nПропусков нет. "
+                "Нажми «Добавить пропуск», чтобы отметить пропущенную пару.")
+    kb = [[InlineKeyboardButton(text=f"✓ Отработал: {o['subj'][:25]} · {o['d'][8:]}.{o['d'][5:7]}",
                                 callback_data=f"od:{o['id']}")] for o in opened]
     kb.append([InlineKeyboardButton(text="➕ Добавить пропуск", callback_data="oa")])
     if done:
