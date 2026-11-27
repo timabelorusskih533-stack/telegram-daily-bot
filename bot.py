@@ -27,10 +27,13 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAPH_TOKEN = os.getenv("TELEGRAPH_TOKEN")
 
 MOSCOW = timezone(timedelta(hours=3))
+MORNING_TIME = "06:05"     # во сколько присылать утреннюю сводку
 EVENING_HOUR = 20          # во сколько присылать расписание на завтра
 REMIND_BEFORE_MIN = 15     # за сколько минут напоминать о паре
 SCHEDULE_REFRESH_MIN = 30  # как часто перечитывать сайт с расписанием
-NEWS_TIMES = ["07:30", "14:00", "17:30", "22:00"]  # когда присылать сводку новостей
+NEWS_TIMES = ["07:40", "14:05", "17:35", "22:00"]  # когда присылать сводку новостей
+BIRTHDAY = (20, 10)        # день рождения пользователя (день, месяц) = 20 октября
+WEATHER_LAT, WEATHER_LON = 55.7558, 37.6173  # Москва
 EXAM_KINDS = {"Экзамен", "Зачёт", "Зачёт (письменный)", "Дифференцированный зачёт", "Контрольная работа"}
 
 # Данные пользователей храним в JSON. На Bothost папка /app/shared не стирается при обновлении бота.
@@ -49,8 +52,9 @@ def now_msk() -> datetime:
 
 # ======================= Хранилище =======================
 
-NOTIFY_DEFAULTS = {"evening": True, "before": True, "otr": True, "changes": True, "news": True}
+NOTIFY_DEFAULTS = {"morning": True, "evening": True, "before": True, "otr": True, "changes": True, "news": True}
 NOTIFY_NAMES = {
+    "morning": f"Утренняя сводка в {MORNING_TIME}",
     "evening": f"Расписание на завтра в {EVENING_HOUR}:00",
     "before": f"За {REMIND_BEFORE_MIN} минут до пары",
     "otr": "Незакрытые отработки",
@@ -199,6 +203,91 @@ def otr_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
 
 
+# ======================= Погода и отсчёты =======================
+
+WMO = {
+    0: ("☀️", "ясно"), 1: ("🌤", "малооблачно"), 2: ("⛅", "переменная облачность"),
+    3: ("☁️", "пасмурно"), 45: ("🌫", "туман"), 48: ("🌫", "изморозь"),
+    51: ("🌦", "морось"), 53: ("🌦", "морось"), 55: ("🌦", "сильная морось"),
+    56: ("🌧", "ледяная морось"), 57: ("🌧", "ледяная морось"),
+    61: ("🌦", "небольшой дождь"), 63: ("🌧", "дождь"), 65: ("🌧", "сильный дождь"),
+    66: ("🌧", "ледяной дождь"), 67: ("🌧", "ледяной дождь"),
+    71: ("🌨", "небольшой снег"), 73: ("🌨", "снег"), 75: ("❄️", "сильный снег"),
+    77: ("🌨", "снежная крупа"), 80: ("🌦", "ливень"), 81: ("🌦", "ливень"),
+    82: ("🌧", "сильный ливень"), 85: ("🌨", "снегопад"), 86: ("🌨", "сильный снегопад"),
+    95: ("⛈", "гроза"), 96: ("⛈", "гроза с градом"), 99: ("⛈", "гроза с градом"),
+}
+
+
+def wmo(code: int) -> tuple[str, str]:
+    return WMO.get(code, ("🌡", ""))
+
+
+def t_sign(t: float) -> str:
+    t = round(t)
+    return f"+{t}" if t > 0 else str(t)
+
+
+async def fetch_weather() -> dict | None:
+    params = {
+        "latitude": WEATHER_LAT, "longitude": WEATHER_LON,
+        "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max",
+        "timezone": "Europe/Moscow", "wind_speed_unit": "ms", "forecast_days": 1,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.open-meteo.com/v1/forecast", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                return await resp.json()
+    except Exception as e:
+        logging.warning(f"Не удалось получить погоду: {e}")
+        return None
+
+
+def weather_now_text(w: dict | None) -> str:
+    if not w or "current" not in w:
+        return ""
+    c = w["current"]
+    emoji, desc = wmo(c.get("weather_code", -1))
+    parts = [f"{emoji} Москва сейчас: {t_sign(c['temperature_2m'])}°"]
+    if desc:
+        parts.append(desc)
+    parts.append(f"ощущается {t_sign(c['apparent_temperature'])}°")
+    parts.append(f"ветер {round(c['wind_speed_10m'])} м/с")
+    return ", ".join(parts)
+
+
+def weather_day_text(w: dict | None) -> str:
+    if not w or "daily" not in w:
+        return ""
+    d = w["daily"]
+    emoji, desc = wmo(d["weather_code"][0])
+    line = (f"{emoji} <b>Погода на день:</b> "
+            f"{t_sign(d['temperature_2m_min'][0])}…{t_sign(d['temperature_2m_max'][0])}°")
+    if desc:
+        line += f", {desc}"
+    prec = d.get("precipitation_probability_max", [None])[0]
+    if prec:
+        line += f", осадки {prec}%"
+    return line
+
+
+def days_until(day: int, month: int) -> int:
+    today = now_msk().date()
+    target = date(today.year, month, day)
+    if target < today:
+        target = date(today.year + 1, month, day)
+    return (target - today).days
+
+
+def countdown_text() -> str:
+    ny = days_until(1, 1)
+    bd = days_until(BIRTHDAY[0], BIRTHDAY[1])
+    return (f"🎄 До Нового года: <b>{ny}</b> " + plural(ny, "день", "дня", "дней") + "\n"
+            f"🎂 До дня рождения: <b>{bd}</b> " + plural(bd, "день", "дня", "дней"))
+
+
 # ======================= Новости (Telegraph) =======================
 
 RSS_FEEDS = [
@@ -316,11 +405,16 @@ async def make_digest() -> str | None:
     entries.sort(key=lambda e: tuple(e.get("published_parsed") or (0,) * 9), reverse=True)
     entries = entries[:NEWS_COUNT]
 
+    weather = await fetch_weather()
     async with aiohttp.ClientSession() as session:
         described = await asyncio.gather(*(describe(session, e) for e in entries))
 
         def build(with_images: bool) -> list:
             content = []
+            now_line = weather_now_text(weather)
+            if now_line:
+                content.append({"tag": "p", "children": [
+                    {"tag": "b", "children": [now_line]}]})
             for e, (summary, image) in zip(entries, described):
                 content.append({"tag": "h4", "children": [e.title.strip()]})
                 if summary:
@@ -381,6 +475,7 @@ async def cmd_start(message: types.Message):
     save_data()
     await message.answer(
         "Привет! Я присылаю уведомления:\n"
+        f"• утром в {MORNING_TIME} — погода на день, пары, отработки и отсчёты;\n"
         f"• вечером в {EVENING_HOUR}:00 — пары на завтра и ближайшие зачёты;\n"
         f"• за {REMIND_BEFORE_MIN} минут до каждой пары;\n"
         "• про незакрытые отработки;\n"
@@ -540,6 +635,34 @@ async def send_to(uid: str, text: str, preview: bool = False):
         logging.error(f"Не удалось отправить {uid}: {e}")
 
 
+def exams_block(exams: list[Lesson]) -> str:
+    return "❗️ <b>Скоро зачёты и экзамены:</b>\n" + "\n".join(
+        f"• {x.day.day} {MON[x.day.month - 1]} — {esc(x.kind)}: {esc(x.subject)}" for x in exams)
+
+
+def otr_block(opened: list[dict]) -> str:
+    n = len(opened)
+    return (f"📝 <b>Незакрытые отработки: {n}</b>\n"
+            + "\n".join(otr_line(o) for o in opened))
+
+
+def morning_text(user: dict, weather: dict | None) -> str:
+    today = now_msk().date()
+    parts = [f"☀️ <b>Доброе утро!</b> {today.day} {MON[today.month - 1]}, {DOW[today.weekday()]}"]
+    wd = weather_day_text(weather)
+    if wd:
+        parts.append(wd)
+    parts.append(day_text(today))
+    exams = [x for x in upcoming_exams(7) if x.day > today]
+    if exams:
+        parts.append(exams_block(exams))
+    opened = open_otr(user)
+    if user["notify"]["otr"] and opened:
+        parts.append(otr_block(opened))
+    parts.append(countdown_text())
+    return "\n\n".join(parts)
+
+
 def evening_text(user: dict) -> str:
     tomorrow = now_msk().date() + timedelta(days=1)
     parts = []
@@ -547,12 +670,10 @@ def evening_text(user: dict) -> str:
         parts.append("🌙 <b>Пары на завтра</b>\n\n" + day_text(tomorrow))
         exams = [x for x in upcoming_exams(7) if x.day > tomorrow]
         if exams:
-            parts.append("❗️ <b>Скоро:</b>\n" + "\n".join(
-                f"• {x.day.day} {MON[x.day.month - 1]} — {esc(x.kind)}: {esc(x.subject)}" for x in exams))
+            parts.append(exams_block(exams))
     opened = open_otr(user)
     if user["notify"]["otr"] and opened:
-        parts.append(f"📝 <b>Незакрытые отработки: {len(opened)}</b>\n" +
-                     "\n".join(f"• {otr_line(o)}" for o in opened))
+        parts.append(otr_block(opened))
     return "\n\n".join(parts)
 
 
@@ -619,6 +740,17 @@ async def notifier():
                 await refresh_schedule()
 
             changed = False
+            # Утренняя сводка: погода на день, пары сегодня, отработки, отсчёты
+            mh, mm = map(int, MORNING_TIME.split(":"))
+            m_at = now.replace(hour=mh, minute=mm, second=0, microsecond=0)
+            if m_at <= now < m_at + timedelta(minutes=10) and not already_sent(f"morning:{now.date()}"):
+                changed = True
+                weather = await fetch_weather()
+                for uid in list(data["users"]):
+                    user = get_user(int(uid))
+                    if user["notify"]["morning"]:
+                        await send_to(uid, morning_text(user, weather))
+
             # Вечерняя сводка: пары на завтра, ближайшие зачёты, незакрытые отработки
             if now.hour == EVENING_HOUR and not already_sent(f"evening:{now.date()}"):
                 changed = True
