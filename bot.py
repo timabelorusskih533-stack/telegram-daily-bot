@@ -98,6 +98,7 @@ def get_user(uid: int) -> dict:
     for k, v in NOTIFY_DEFAULTS.items():
         user["notify"].setdefault(k, v)
     user.setdefault("otr", [])
+    user.setdefault("reminders", [])
     return user
 
 
@@ -438,15 +439,188 @@ async def make_digest() -> str | None:
         return None
 
 
+# ======================= Напоминания =======================
+
+REM_DEFAULT_HOUR = 9
+REM_WEEKDAYS = {"понедельник": 0, "пн": 0, "вторник": 1, "вт": 1, "среда": 2, "среду": 2, "ср": 2,
+    "четверг": 3, "чт": 3, "пятница": 4, "пятницу": 4, "пт": 4, "суббота": 5, "субботу": 5, "сб": 5,
+    "воскресенье": 6, "вс": 6}
+REM_MONTHS = {"январ": 1, "феврал": 2, "март": 3, "апрел": 4, "ма": 5, "июн": 6, "июл": 7,
+    "август": 8, "сентябр": 9, "октябр": 10, "ноябр": 11, "декабр": 12}
+
+rem_awaiting: set[int] = set()  # кто сейчас вводит напоминание через кнопку
+
+
+def _rem_relative(s: str, now: datetime):
+    m = re.search(r'через\s+(полтора часа|полчаса|\d+|час|день|недел[юя])\s*'
+                  r'(минут\w*|мин|час\w*|\bч\b|дн\w*|день|дня|дней|недел\w*)?', s, re.I)
+    if not m:
+        return None
+    num, unit = m.group(1).lower(), (m.group(2) or "").lower()
+    if num == "полчаса":
+        delta = timedelta(minutes=30)
+    elif num == "полтора часа":
+        delta = timedelta(minutes=90)
+    elif num == "час":
+        delta = timedelta(hours=1)
+    elif num == "день":
+        delta = timedelta(days=1)
+    elif num in ("неделю", "недели"):
+        delta = timedelta(weeks=1)
+    else:
+        n = int(num)
+        if unit.startswith("мин"):
+            delta = timedelta(minutes=n)
+        elif unit.startswith(("час", "ч")):
+            delta = timedelta(hours=n)
+        elif unit.startswith("недел"):
+            delta = timedelta(weeks=n)
+        elif unit.startswith(("дн", "день", "дня", "дней")):
+            delta = timedelta(days=n)
+        else:
+            delta = timedelta(minutes=n)
+    return now + delta, m.span()
+
+
+def _rem_time(s: str):
+    for pat, kind in [
+        (r'\b(?:в|к|во)\s+(\d{1,2})[:.](\d{2})', "hm"),
+        (r'\b(\d{1,2})[:.](\d{2})\b', "hm"),
+        (r'\b(?:в|к|во)\s+(\d{1,2})\s*(утра|дня|вечера|ночи)\b', "hp"),
+        (r'\b(\d{1,2})\s*(утра|дня|вечера|ночи)\b', "hp"),
+        (r'\b(?:в|к|во)\s+(\d{1,2})\s*(?:час\w*|ч)\b', "h"),
+        (r'\b(?:в|к|во)\s+(\d{1,2})\b(?!\s*(?:числ|\d))', "h"),
+    ]:
+        m = re.search(pat, s, re.I)
+        if not m:
+            continue
+        h, mi = int(m.group(1)), 0
+        if kind == "hm":
+            mi = int(m.group(2))
+        elif kind == "hp":
+            p = m.group(2).lower()
+            if p == "вечера" and h < 12:
+                h += 12
+            if p == "дня" and h <= 6:
+                h += 12
+            if p == "ночи" and h == 12:
+                h = 0
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return h, mi, m.span()
+    return None
+
+
+def _rem_day(s: str, now: datetime):
+    today = now.date()
+    m = re.search(r'\b(сегодня|завтра|послезавтра)\b', s, re.I)
+    if m:
+        off = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[m.group(1).lower()]
+        return today + timedelta(days=off), m.span()
+    m = re.search(r'\b(?:в|во)\s+(' + "|".join(REM_WEEKDAYS) + r')\b', s, re.I)
+    if m:
+        delta = (REM_WEEKDAYS[m.group(1).lower()] - today.weekday()) % 7 or 7
+        return today + timedelta(days=delta), m.span()
+    m = re.search(r'\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b', s)
+    if m:
+        dd, mm, yy = int(m.group(1)), int(m.group(2)), m.group(3)
+        year = today.year if not yy else (2000 + int(yy) if len(yy) == 2 else int(yy))
+        try:
+            d = date(year, mm, dd)
+            if not yy and d < today:
+                d = date(year + 1, mm, dd)
+            return d, m.span()
+        except ValueError:
+            pass
+    m = re.search(r'\b(\d{1,2})\s+([а-яё]+)', s, re.I)
+    if m:
+        mon = next((v for k, v in REM_MONTHS.items() if m.group(2).lower().startswith(k)), None)
+        if mon:
+            try:
+                d = date(today.year, mon, int(m.group(1)))
+                if d < today:
+                    d = date(today.year + 1, mon, int(m.group(1)))
+                return d, m.span()
+            except ValueError:
+                pass
+    return None
+
+
+def _rem_body(s: str) -> str:
+    s = re.sub(r"\s+", " ", s).strip(" ,.;:-—")
+    return re.sub(r"^(что|чтобы|о том,?\s*что|про|о|об|надо|нужно)\s+", "", s, flags=re.I).strip()
+
+
+def parse_reminder(text: str, now: datetime | None = None):
+    """Разбирает «напомни ... <время> ... <текст>». Возвращает (datetime|None, текст)."""
+    now = now or now_msk()
+    s = re.sub(r"^(напомни(ть)?|напоминание|поставь напоминание|ремайнд)\b[:,\s]*",
+               "", text.strip(), flags=re.I).strip()
+    rel = _rem_relative(s, now)
+    if rel:
+        when, sp = rel
+        return when.replace(second=0, microsecond=0), _rem_body(s[:sp[0]] + s[sp[1]:])
+    day = _rem_day(s, now)
+    rest = s
+    base = None
+    if day:
+        base, sp = day
+        rest = rest[:sp[0]] + rest[sp[1]:]
+    tm = _rem_time(rest)
+    if base and tm:
+        h, mi, sp = tm
+        when = datetime(base.year, base.month, base.day, h, mi)
+        rest = rest[:sp[0]] + rest[sp[1]:]
+    elif base:
+        when = datetime(base.year, base.month, base.day, REM_DEFAULT_HOUR, 0)
+    elif tm:
+        h, mi, sp = tm
+        when = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+        if when <= now:
+            when += timedelta(days=1)
+        rest = rest[:sp[0]] + rest[sp[1]:]
+    else:
+        return None, _rem_body(s)
+    return when.replace(second=0, microsecond=0), _rem_body(rest)
+
+
+def when_text(dt: datetime) -> str:
+    today = now_msk().date()
+    tm = dt.strftime("%H:%M")
+    if dt.date() == today:
+        return f"сегодня в {tm}"
+    if dt.date() == today + timedelta(days=1):
+        return f"завтра в {tm}"
+    return f"{dt.day} {MON[dt.month - 1]} ({DOW_S[dt.weekday()]}) в {tm}"
+
+
+def rem_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
+    items = sorted(user["reminders"], key=lambda r: r["when"])
+    if items:
+        lines = [f"<blockquote>⏰ <b>{when_text(datetime.fromisoformat(r['when']))}</b>\n"
+                 f"{esc(r['text'])}</blockquote>" for r in items]
+        text = "⏰ <b>Напоминания</b>\n\n" + "\n".join(lines)
+    else:
+        text = ("⏰ <b>Напоминания</b>\n\nПусто. Просто напиши мне, например:\n"
+                "• <i>напомни завтра в 18:00 сдать реферат</i>\n"
+                "• <i>напомни через 2 часа забрать форму</i>\n"
+                "• <i>напомни в понедельник в 9 построение</i>")
+    kb = [[InlineKeyboardButton(text=f"🗑 {datetime.fromisoformat(r['when']).strftime('%d.%m %H:%M')} — {r['text'][:25]}",
+                                callback_data=f"rd:{r['id']}")] for r in items]
+    kb.append([InlineKeyboardButton(text="➕ Добавить напоминание", callback_data="ra")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
 # ======================= Кнопки =======================
 
 BTN_OTR = "📝 Отработки"
 BTN_NEWS = "📰 Новости"
+BTN_REM = "⏰ Напоминания"
 BTN_SETTINGS = "🔔 Уведомления"
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_OTR), KeyboardButton(text=BTN_NEWS), KeyboardButton(text=BTN_SETTINGS)],
+        [KeyboardButton(text=BTN_OTR), KeyboardButton(text=BTN_NEWS)],
+        [KeyboardButton(text=BTN_REM), KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -481,7 +655,10 @@ async def cmd_start(message: types.Message):
         "• про незакрытые отработки;\n"
         "• если расписание на сайте изменилось;\n"
         f"• сводку новостей в {', '.join(NEWS_TIMES)}.\n\n"
-        "Кнопки внизу — отработки, новости и настройка уведомлений.",
+        "💡 А ещё я напоминалка — напиши, например:\n"
+        "<i>напомни завтра в 18:00 сдать реферат</i>\n\n"
+        "Кнопки внизу — отработки, новости, напоминания и уведомления.",
+        parse_mode="HTML",
         reply_markup=MAIN_KB,
     )
 
@@ -601,6 +778,64 @@ async def cb_settings(call: types.CallbackQuery):
     text, kb = settings_view(user)
     await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
     await call.answer()
+
+
+@dp.message(Command("reminders"))
+@dp.message(F.text == BTN_REM)
+async def show_reminders(message: types.Message):
+    rem_awaiting.discard(message.from_user.id)
+    text, kb = rem_view(get_user(message.from_user.id))
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "ra")
+async def cb_rem_add(call: types.CallbackQuery):
+    rem_awaiting.add(call.from_user.id)
+    await call.message.answer(
+        "✍️ Напиши напоминание с временем, например:\n"
+        "• <i>завтра в 18:00 сдать реферат</i>\n"
+        "• <i>через 2 часа забрать форму</i>\n"
+        "• <i>в понедельник в 9 построение</i>",
+        parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("rd:"))
+async def cb_rem_del(call: types.CallbackQuery):
+    user = get_user(call.from_user.id)
+    user["reminders"] = [r for r in user["reminders"] if r["id"] != call.data[3:]]
+    save_data()
+    text, kb = rem_view(user)
+    await call.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await call.answer("Удалено")
+
+
+def add_reminder(message: types.Message) -> bool:
+    """Пытается создать напоминание из текста. True — если распознал время."""
+    when, body = parse_reminder(message.text, now_msk())
+    if not when:
+        return False
+    user = get_user(message.from_user.id)
+    user["reminders"].append({"id": uuid.uuid4().hex[:8], "when": when.isoformat(),
+                              "text": body or "Напоминание"})
+    save_data()
+    return True
+
+
+@dp.message(F.text.regexp(r"^(?i:напомни|напоминание|ремайнд)"))
+async def on_reminder_text(message: types.Message):
+    when, body = parse_reminder(message.text, now_msk())
+    rem_awaiting.discard(message.from_user.id)
+    if not when:
+        await message.answer(
+            "Не понял, когда напомнить 🤔 Укажи время, например:\n"
+            "• <i>напомни завтра в 18:00 сдать реферат</i>\n"
+            "• <i>напомни через 2 часа забрать форму</i>",
+            parse_mode="HTML", reply_markup=MAIN_KB)
+        return
+    add_reminder(message)
+    await message.answer(f"✅ Напомню <b>{when_text(when)}</b>:\n{esc(body or 'Напоминание')}",
+                         parse_mode="HTML", reply_markup=MAIN_KB)
 
 
 @dp.message(Command("news"))
@@ -759,6 +994,17 @@ async def notifier():
                     if text:
                         await send_to(uid, text)
 
+            # Личные напоминания
+            for uid in list(data["users"]):
+                user = get_user(int(uid))
+                due = [r for r in user["reminders"] if datetime.fromisoformat(r["when"]) <= now]
+                for r in due:
+                    changed = True
+                    await send_to(uid, f"⏰ <b>Напоминание</b>\n\n{esc(r['text'])}")
+                if due:
+                    user["reminders"] = [r for r in user["reminders"]
+                                         if datetime.fromisoformat(r["when"]) > now]
+
             # Напоминание перед парой
             for x in lessons_on(now.date()):
                 delta = x.start_dt - now
@@ -787,6 +1033,27 @@ async def notifier():
         await asyncio.sleep(30)
 
 
+@dp.message(F.text & ~F.text.startswith("/"))
+async def on_free_text(message: types.Message):
+    if message.from_user.id in rem_awaiting:
+        rem_awaiting.discard(message.from_user.id)
+        when, body = parse_reminder("напомни " + message.text, now_msk())
+        if when:
+            get_user(message.from_user.id)["reminders"].append(
+                {"id": uuid.uuid4().hex[:8], "when": when.isoformat(), "text": body or "Напоминание"})
+            save_data()
+            await message.answer(f"✅ Напомню <b>{when_text(when)}</b>:\n{esc(body or 'Напоминание')}",
+                                 parse_mode="HTML", reply_markup=MAIN_KB)
+        else:
+            await message.answer("Не понял время. Попробуй: <i>завтра в 18:00 ...</i>",
+                                 parse_mode="HTML", reply_markup=MAIN_KB)
+        return
+    await message.answer(
+        "Выбери кнопку ниже или напиши напоминание, например:\n"
+        "<i>напомни завтра в 18:00 сдать реферат</i>",
+        parse_mode="HTML", reply_markup=MAIN_KB)
+
+
 async def main():
     if not BOT_TOKEN:
         raise ValueError("Не задана переменная окружения BOT_TOKEN!")
@@ -798,6 +1065,7 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="otr", description="Отработки"),
         BotCommand(command="news", description="Сводка новостей"),
+        BotCommand(command="reminders", description="Напоминания"),
         BotCommand(command="settings", description="Настройка уведомлений"),
     ])
 
