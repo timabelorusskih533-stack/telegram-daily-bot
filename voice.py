@@ -68,16 +68,16 @@ async def ensure_model(data_dir: str):
 
 
 def _decode_pcm16(data: bytes) -> bytes:
-    """ogg/opus -> 16 кГц моно s16le."""
+    """ogg/opus -> 16 кГц моно s16le (чистый PCM без выравнивающего мусора)."""
     import av
     ic = av.open(io.BytesIO(data))
     resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
     out = bytearray()
     for frame in ic.decode(audio=0):
         for rf in resampler.resample(frame):
-            out += bytes(rf.planes[0])
+            out += rf.to_ndarray().tobytes()
     for rf in resampler.resample(None):
-        out += bytes(rf.planes[0])
+        out += rf.to_ndarray().tobytes()
     ic.close()
     return bytes(out)
 

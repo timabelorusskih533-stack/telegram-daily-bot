@@ -3,3 +3,4 @@ aiohttp
 feedparser
 vosk
 av
+numpy
