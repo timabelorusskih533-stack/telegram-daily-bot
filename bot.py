@@ -322,12 +322,12 @@ async def make_digest() -> str | None:
         def build(with_images: bool) -> list:
             content = []
             for e, (summary, image) in zip(entries, described):
-                if with_images and image:
-                    content.append({"tag": "figure", "children": [
-                        {"tag": "img", "attrs": {"src": image}}]})
                 content.append({"tag": "h4", "children": [e.title.strip()]})
                 if summary:
                     content.append({"tag": "p", "children": [summary]})
+                if with_images and image:
+                    content.append({"tag": "figure", "children": [
+                        {"tag": "img", "attrs": {"src": image}}]})
             return content
 
         token = await ensure_telegraph_account(session)
