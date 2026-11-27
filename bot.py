@@ -224,6 +224,30 @@ def load_motivations() -> list[str]:
 
 MOTIVATIONS = load_motivations()
 
+HOLIDAYS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holidays.txt")
+
+
+def load_holidays() -> dict[str, str]:
+    res = {}
+    try:
+        with open(HOLIDAYS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "|" not in line:
+                    continue
+                date_key, names = line.split("|", 1)
+                res[date_key.strip()] = names.strip()
+    except FileNotFoundError:
+        pass
+    return res
+
+
+HOLIDAYS = load_holidays()
+
+
+def today_holiday() -> str:
+    return HOLIDAYS.get(now_msk().strftime("%m-%d"), "")
+
 
 def motiv_schedule_today() -> list[str]:
     """3 случайных времени на сегодня в окне [START,END]. Генерируются раз в день."""
@@ -977,6 +1001,15 @@ async def on_reminder_text(message: types.Message):
                          parse_mode="HTML", reply_markup=MAIN_KB)
 
 
+@dp.message(Command("holiday"))
+async def cmd_holiday(message: types.Message):
+    hol = today_holiday()
+    if hol:
+        await message.answer(f"🎉 <b>Сегодня:</b> {esc(hol)}", parse_mode="HTML")
+    else:
+        await message.answer("Сегодня без особого праздника — но это не повод не улыбнуться 🙂")
+
+
 @dp.message(Command("motivation"))
 async def cmd_motivation(message: types.Message):
     await message.answer(format_motivation(next_motivation()), parse_mode="HTML")
@@ -1028,6 +1061,9 @@ def otr_block(opened: list[dict]) -> str:
 def morning_text(user: dict, weather: dict | None) -> str:
     today = now_msk().date()
     parts = [f"☀️ <b>Доброе утро!</b> {today.day} {MON[today.month - 1]}, {DOW[today.weekday()]}"]
+    hol = today_holiday()
+    if hol:
+        parts.append(f"🎉 Сегодня: {esc(hol)}")
     wd = weather_day_text(weather)
     if wd:
         parts.append(wd)
@@ -1223,6 +1259,7 @@ async def main():
         BotCommand(command="news", description="Сводка новостей"),
         BotCommand(command="reminders", description="Напоминания"),
         BotCommand(command="motivation", description="Мотивация прямо сейчас"),
+        BotCommand(command="holiday", description="Праздник сегодня"),
         BotCommand(command="settings", description="Настройка уведомлений"),
     ])
 
