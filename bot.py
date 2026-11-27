@@ -29,6 +29,8 @@ TELEGRAPH_TOKEN = os.getenv("TELEGRAPH_TOKEN")
 
 MOSCOW = timezone(timedelta(hours=3))
 MORNING_TIME = "06:05"     # во сколько присылать утреннюю сводку
+MOTIV_PER_DAY = 3          # сколько мотивационных сообщений в день
+MOTIV_START_H, MOTIV_END_H = 7, 22  # окно отправки мотивации
 EVENING_HOUR = 20          # во сколько присылать расписание на завтра
 REMIND_BEFORE_MIN = 15     # за сколько минут напоминать о паре
 SCHEDULE_REFRESH_MIN = 30  # как часто перечитывать сайт с расписанием
@@ -53,7 +55,7 @@ def now_msk() -> datetime:
 
 # ======================= Хранилище =======================
 
-NOTIFY_DEFAULTS = {"morning": True, "evening": True, "before": True, "otr": True, "changes": True, "news": True}
+NOTIFY_DEFAULTS = {"morning": True, "evening": True, "before": True, "otr": True, "changes": True, "news": True, "motivation": True}
 NOTIFY_NAMES = {
     "morning": f"Утренняя сводка в {MORNING_TIME}",
     "evening": f"Расписание на завтра в {EVENING_HOUR}:00",
@@ -61,6 +63,7 @@ NOTIFY_NAMES = {
     "otr": "Незакрытые отработки",
     "changes": "Изменения в расписании",
     "news": "Новости в " + ", ".join(NEWS_TIMES),
+    "motivation": f"Мотивация ({MOTIV_PER_DAY} в день, случайно)",
 }
 
 data: dict = {"users": {}, "sent": []}
@@ -203,6 +206,60 @@ def otr_view(user: dict) -> tuple[str, InlineKeyboardMarkup]:
     if done:
         kb.append([InlineKeyboardButton(text="↩️ Вернуть отработанную", callback_data="ou")])
     return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# ======================= Мотивация =======================
+
+MOTIV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "motivations.txt")
+MOTIV_EMOJI = ["💪", "🔥", "⚡️", "🌟", "✨", "🚀", "🏆", "🎯", "🌅", "👊", "🧭", "💥", "🦾", "☀️", "🌱"]
+
+
+def load_motivations() -> list[str]:
+    try:
+        with open(MOTIV_FILE, encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except FileNotFoundError:
+        return ["Ты справишься. Просто начни."]
+
+
+MOTIVATIONS = load_motivations()
+
+
+def motiv_schedule_today() -> list[str]:
+    """3 случайных времени на сегодня в окне [START,END]. Генерируются раз в день."""
+    import random
+    today = now_msk().date().isoformat()
+    sched = data.setdefault("motiv_sched", {})
+    if today not in sched:
+        lo, hi = MOTIV_START_H * 60, MOTIV_END_H * 60
+        n = min(MOTIV_PER_DAY, hi - lo + 1)
+        minutes = sorted(random.sample(range(lo, hi + 1), n))
+        sched[today] = [f"{m // 60:02d}:{m % 60:02d}" for m in minutes]
+        for d in list(sched):            # чистим прошлые дни
+            if d < today:
+                del sched[d]
+        save_data()
+    return sched[today]
+
+
+def next_motivation() -> str:
+    """Следующее сообщение из перемешанного пула: пока все не пройдут — повторов нет."""
+    import random
+    order = data.get("motiv_order") or []
+    pos = data.get("motiv_pos", 0)
+    if not order or pos >= len(order) or len(order) != len(MOTIVATIONS):
+        order = list(range(len(MOTIVATIONS)))
+        random.shuffle(order)
+        pos = 0
+    msg = MOTIVATIONS[order[pos]]
+    data["motiv_order"] = order
+    data["motiv_pos"] = pos + 1
+    return msg
+
+
+def format_motivation(text: str) -> str:
+    import random
+    return f"{random.choice(MOTIV_EMOJI)} <i>{esc(text)}</i>"
 
 
 # ======================= Погода и отсчёты =======================
@@ -698,7 +755,8 @@ async def cmd_start(message: types.Message):
         f"• за {REMIND_BEFORE_MIN} минут до каждой пары;\n"
         "• про незакрытые отработки;\n"
         "• если расписание на сайте изменилось;\n"
-        f"• сводку новостей в {', '.join(NEWS_TIMES)}.\n\n"
+        f"• сводку новостей в {', '.join(NEWS_TIMES)};\n"
+        f"• {MOTIV_PER_DAY} мотивационных сообщения в день в случайное время.\n\n"
         "💡 А ещё я напоминалка — напиши, например:\n"
         "<i>напомни завтра в 18:00 сдать реферат</i>\n\n"
         "Кнопки внизу — отработки, новости, напоминания и уведомления.",
@@ -919,6 +977,11 @@ async def on_reminder_text(message: types.Message):
                          parse_mode="HTML", reply_markup=MAIN_KB)
 
 
+@dp.message(Command("motivation"))
+async def cmd_motivation(message: types.Message):
+    await message.answer(format_motivation(next_motivation()), parse_mode="HTML")
+
+
 @dp.message(Command("news"))
 @dp.message(F.text == BTN_NEWS)
 async def cmd_news(message: types.Message):
@@ -1075,6 +1138,17 @@ async def notifier():
                     if text:
                         await send_to(uid, text)
 
+            # Мотивация: 3 раза в день в случайное время
+            for slot in motiv_schedule_today():
+                sh, sm = map(int, slot.split(":"))
+                at = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+                if at <= now < at + timedelta(minutes=5) and not already_sent(f"motiv:{now.date()}:{slot}"):
+                    changed = True
+                    text = format_motivation(next_motivation())
+                    for uid in list(data["users"]):
+                        if get_user(int(uid))["notify"]["motivation"]:
+                            await send_to(uid, text)
+
             # Личные напоминания
             for uid in list(data["users"]):
                 user = get_user(int(uid))
@@ -1148,6 +1222,7 @@ async def main():
         BotCommand(command="otr", description="Отработки"),
         BotCommand(command="news", description="Сводка новостей"),
         BotCommand(command="reminders", description="Напоминания"),
+        BotCommand(command="motivation", description="Мотивация прямо сейчас"),
         BotCommand(command="settings", description="Настройка уведомлений"),
     ])
 
